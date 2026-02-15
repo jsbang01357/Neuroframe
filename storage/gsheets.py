@@ -7,6 +7,8 @@ import datetime as dt
 
 import gspread
 
+from .security import hash_password, is_password_hashed, verify_password
+
 
 # ----------------------------
 # Config
@@ -183,7 +185,7 @@ class NeuroGSheets:
             return False
         data = {
             "username": username,
-            "password": password,
+            "password": hash_password(password),
             "created_at": _now_iso(),
             "last_login": "",
             "baseline_sleep_start": "",
@@ -202,10 +204,25 @@ class NeuroGSheets:
         return True
 
     def verify_login(self, username: str, password: str) -> bool:
+        row_idx = _find_row_index_by_key(self.users, "username", username)
+        if row_idx is None:
+            return False
         u = self.get_user(username)
         if not u:
             return False
-        return str(u.get("password", "")) == str(password)
+
+        stored = str(u.get("password", ""))
+        provided = str(password)
+
+        if is_password_hashed(stored):
+            return verify_password(provided, stored)
+
+        # Legacy plaintext fallback: allow login once, then migrate to hash.
+        if stored == provided:
+            _update_row_dict(self.users, row_idx, {"password": hash_password(provided)})
+            return True
+
+        return False
 
     def update_last_login(self, username: str):
         row_idx = _find_row_index_by_key(self.users, "username", username)

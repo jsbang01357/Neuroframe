@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any, List
 import datetime as dt
 
 import gspread
+from gspread.exceptions import WorksheetNotFound
 
 from .security import hash_password, is_password_hashed, verify_password
 
@@ -19,6 +20,7 @@ class GSheetsConfig:
     spreadsheet_name: str = "NeuroFrame_DB"
     users_ws: str = "users"
     logs_ws: str = "daily_logs"
+    checkins_ws: str = "checkins"
 
     # Required columns (MVP)
     # users:
@@ -142,10 +144,17 @@ class NeuroGSheets:
         self.cfg = cfg or GSheetsConfig()
 
         self.sh = self.gc.open(self.cfg.spreadsheet_name)
-        self.users = self.sh.worksheet(self.cfg.users_ws)
-        self.logs = self.sh.worksheet(self.cfg.logs_ws)
+        self.users = self._get_or_create_ws(self.cfg.users_ws)
+        self.logs = self._get_or_create_ws(self.cfg.logs_ws)
+        self.checkins = self._get_or_create_ws(self.cfg.checkins_ws)
 
         self._init_schema()
+
+    def _get_or_create_ws(self, title: str):
+        try:
+            return self.sh.worksheet(title)
+        except WorksheetNotFound:
+            return self.sh.add_worksheet(title=title, rows=1000, cols=30)
 
     def _init_schema(self):
         users_headers = [
@@ -166,8 +175,16 @@ class NeuroGSheets:
             "subjective_clarity",
             "updated_at",
         ]
+        checkins_headers = [
+            "date", "username",
+            "actual_focus_minutes",
+            "energy_satisfaction",
+            "notes",
+            "updated_at",
+        ]
         _ensure_headers(self.users, users_headers)
         _ensure_headers(self.logs, logs_headers)
+        _ensure_headers(self.checkins, checkins_headers)
 
     # -------- Users --------
 
@@ -297,3 +314,49 @@ class NeuroGSheets:
             _append_row_dict(self.logs, payload)
         else:
             _update_row_dict(self.logs, found_row_idx, payload)
+
+    def get_daily_logs_for_user(self, username: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        logs = _get_all_records(self.logs)
+        out = [r for r in logs if str(r.get("username", "")).strip() == str(username).strip()]
+        out.sort(key=lambda r: str(r.get("date", "")), reverse=True)
+        if limit is not None:
+            return out[: max(0, int(limit))]
+        return out
+
+    # -------- Daily check-ins --------
+
+    def get_checkin(self, username: str, date: dt.date) -> Optional[Dict[str, Any]]:
+        date_s = _date_iso(date)
+        records = _get_all_records(self.checkins)
+        for r in records:
+            if str(r.get("username", "")).strip() == username and str(r.get("date", "")).strip() == date_s:
+                return r
+        return None
+
+    def get_checkins_for_user(self, username: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        rows = _get_all_records(self.checkins)
+        out = [r for r in rows if str(r.get("username", "")).strip() == str(username).strip()]
+        out.sort(key=lambda r: str(r.get("date", "")), reverse=True)
+        if limit is not None:
+            return out[: max(0, int(limit))]
+        return out
+
+    def upsert_checkin(self, username: str, date: dt.date, data: Dict[str, Any]) -> None:
+        date_s = _date_iso(date)
+        headers = self.checkins.row_values(1)
+        if not headers:
+            raise RuntimeError("checkins sheet has no header row.")
+
+        records = _get_all_records(self.checkins)
+        found_row_idx = None
+        for i, r in enumerate(records, start=2):
+            if str(r.get("username", "")).strip() == username and str(r.get("date", "")).strip() == date_s:
+                found_row_idx = i
+                break
+
+        payload = {"date": date_s, "username": username, "updated_at": _now_iso()}
+        payload.update(data)
+        if found_row_idx is None:
+            _append_row_dict(self.checkins, payload)
+        else:
+            _update_row_dict(self.checkins, found_row_idx, payload)

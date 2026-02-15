@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import datetime as dt
 
 from neuroframe.engine import UserBaseline
@@ -52,6 +52,19 @@ class NeuroRepo:
 
     def upsert_daily_log(self, username: str, date: dt.date, data: Dict[str, Any]) -> None:
         self.db.upsert_daily_log(username, date, data)
+
+    def get_daily_logs_for_user(self, username: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        return self.db.get_daily_logs_for_user(username, limit=limit)
+
+    # ---- daily check-in ----
+    def get_checkin(self, username: str, date: dt.date) -> Optional[Dict[str, Any]]:
+        return self.db.get_checkin(username, date)
+
+    def get_checkins_for_user(self, username: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        return self.db.get_checkins_for_user(username, limit=limit)
+
+    def upsert_checkin(self, username: str, date: dt.date, data: Dict[str, Any]) -> None:
+        self.db.upsert_checkin(username, date, data)
 
     # ---- internal ----
     def _row_to_baseline(self, row: Dict[str, Any]) -> UserBaseline:

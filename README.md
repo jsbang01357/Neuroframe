@@ -14,11 +14,18 @@ It is not a medical treatment app. It is a day-design tool based on a lightweigh
 - User signup/login
 - Per-user baseline setup (onboarding wizard)
 - Daily input editing (sleep override, caffeine doses, workload, clarity)
+- Input friction reducers:
+  - caffeine quick presets
+  - auto-fill from last 7-day pattern
 - 24h net-energy curve visualization
+- Prediction confidence indicator (high/medium/low with reasons)
 - Zone interpretation:
   - Prime Zone (deep work)
   - Crash Zone (low-load tasks)
   - Sleep Gate (wind-down)
+- Auto-generated tomorrow plan + draft save
+- End-of-day 10-second check-in (focus minutes, satisfaction, notes)
+- Weekly report (prime-time tendency, crash load, check-in summary)
 - Basic adaptation (`baseline_offset`) from daily self-rating
 - Admin page for user baseline editing and log inspection
 
@@ -123,6 +130,14 @@ or from multipage mode in the app sidebar (`pages/1_Admin.py`).
 - `subjective_clarity`
 - `updated_at`
 
+`checkins` columns:
+
+- `date`, `username`
+- `actual_focus_minutes`
+- `energy_satisfaction`
+- `notes`
+- `updated_at`
+
 ## Security Notes
 
 - Passwords are stored as PBKDF2-SHA256 hashes (not plaintext).
@@ -136,4 +151,3 @@ Run unit tests:
 ```bash
 python -m unittest discover -s tests -v
 ```
-

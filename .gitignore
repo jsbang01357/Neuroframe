@@ -1,0 +1,15 @@
+# Virtual environments
+venv_neuro/
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# OS / Editor
+.DS_Store
+.vscode/

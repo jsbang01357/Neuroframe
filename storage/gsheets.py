@@ -32,7 +32,7 @@ class GSheetsConfig:
     #
     # daily_logs:
     #   date, username, sleep_override_on, sleep_cross_midnight, sleep_start, wake_time,
-    #   doses_json, workload_level, subjective_clarity
+    #   doses_json, shift_blocks_json, day_shift_hours, workload_level, subjective_clarity
 
 
 # ----------------------------
@@ -64,13 +64,19 @@ def _coerce_bool(x: Any, default: bool = False) -> bool:
     return default
 
 def _ensure_headers(ws, headers: List[str]):
-    """If worksheet is empty, set header row."""
+    """Ensure worksheet has required headers (append missing columns)."""
     existing = ws.row_values(1)
     if not existing:
         ws.append_row(headers)
         return
-    # If existing headers differ, we won't auto-migrate here (avoid breaking data).
-    # You can handle migration manually if needed.
+    updated = list(existing)
+    changed = False
+    for h in headers:
+        if h not in updated:
+            updated.append(h)
+            changed = True
+    if changed:
+        ws.update(f"A1:{_col_letter(len(updated))}1", [updated])
 
 def _get_all_records(ws) -> List[Dict[str, Any]]:
     # gspread get_all_records() treats first row as header
@@ -171,12 +177,16 @@ class NeuroGSheets:
             "sleep_override_on", "sleep_cross_midnight",
             "sleep_start", "wake_time",
             "doses_json",
+            "shift_blocks_json",
+            "day_shift_hours",
             "workload_level",
             "subjective_clarity",
             "updated_at",
         ]
         checkins_headers = [
             "date", "username",
+            "subjective_clarity",
+            "focus_success",
             "actual_focus_minutes",
             "energy_satisfaction",
             "notes",
@@ -258,6 +268,46 @@ class NeuroGSheets:
             return False
         _update_row_dict(self.users, row_idx, patch)
         return True
+
+    def count_password_rows(self) -> Dict[str, int]:
+        rows = _get_all_records(self.users)
+        total = 0
+        hashed = 0
+        plaintext = 0
+        empty = 0
+        for r in rows:
+            total += 1
+            pw = str(r.get("password", "") or "").strip()
+            if not pw:
+                empty += 1
+                continue
+            if is_password_hashed(pw):
+                hashed += 1
+            else:
+                plaintext += 1
+        return {"total": total, "hashed": hashed, "plaintext": plaintext, "empty": empty}
+
+    def migrate_plaintext_passwords(self) -> int:
+        """
+        One-time migration helper.
+        Hashes any non-empty plaintext password row in users sheet.
+        Returns number of migrated rows.
+        """
+        headers = self.users.row_values(1)
+        if not headers:
+            raise RuntimeError("users sheet has no header row.")
+
+        records = _get_all_records(self.users)
+        migrated = 0
+        for i, r in enumerate(records, start=2):
+            pw = str(r.get("password", "") or "").strip()
+            if not pw:
+                continue
+            if is_password_hashed(pw):
+                continue
+            _update_row_dict(self.users, i, {"password": hash_password(pw)})
+            migrated += 1
+        return migrated
 
     def user_to_baseline_dict(self, user_row: Dict[str, Any]) -> Dict[str, Any]:
         """Convert sheet row -> baseline kwargs-friendly dict."""

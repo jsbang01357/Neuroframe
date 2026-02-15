@@ -14,18 +14,22 @@ It is not a medical treatment app. It is a day-design tool based on a lightweigh
 - User signup/login
 - Per-user baseline setup (onboarding wizard)
 - Daily input editing (sleep override, caffeine doses, workload, clarity)
+- Morning check-in mode (30 seconds): sleep, day shift, caffeine plan, workload
+- Shift mode templates: `Day`, `Evening`, `Night`, `24h-call`, `Off`
 - Input friction reducers:
   - caffeine quick presets
   - auto-fill from last 7-day pattern
-- 24h net-energy curve visualization
+- Summary-first dashboard (Prime / Crash / Sleep Gate cards + top 3 actions)
+- 24h net-energy curve visualization (detail section)
 - Prediction confidence indicator (high/medium/low with reasons)
 - Zone interpretation:
   - Prime Zone (deep work)
   - Crash Zone (low-load tasks)
   - Sleep Gate (wind-down)
 - Auto-generated tomorrow plan + draft save
-- End-of-day 10-second check-in (focus minutes, satisfaction, notes)
-- Weekly report (prime-time tendency, crash load, check-in summary)
+- End-of-day check-in (subjective clarity, focus success, notes)
+- Weekly report (prime average start, crash average length, sleep debt, caffeine total)
+- Shift-aware interpretation (zone overlap warnings + nap suggestions)
 - Basic adaptation (`baseline_offset`) from daily self-rating
 - Admin page for user baseline editing and log inspection
 
@@ -68,10 +72,11 @@ source venv_neuro/bin/activate
 pip install -r requirements.txt
 ```
 
-3. Create `.streamlit/secrets.toml` with:
+3. For local development only, create `.streamlit/secrets.toml` with:
 
 ```toml
 admin_pass = "your-admin-password"
+admin_allowlist = ["admin_username_1", "admin_username_2"]
 
 [gcp_service_account]
 type = "service_account"
@@ -90,6 +95,7 @@ client_x509_cert_url = "..."
 
 - `users`
 - `daily_logs`
+- `checkins`
 
 Headers are auto-initialized when worksheets are empty.
 
@@ -126,6 +132,8 @@ or from multipage mode in the app sidebar (`pages/1_Admin.py`).
 - `sleep_override_on`, `sleep_cross_midnight`
 - `sleep_start`, `wake_time`
 - `doses_json`
+- `shift_blocks_json`
+- `day_shift_hours`
 - `workload_level`
 - `subjective_clarity`
 - `updated_at`
@@ -133,6 +141,8 @@ or from multipage mode in the app sidebar (`pages/1_Admin.py`).
 `checkins` columns:
 
 - `date`, `username`
+- `subjective_clarity`
+- `focus_success`
 - `actual_focus_minutes`
 - `energy_satisfaction`
 - `notes`
@@ -142,7 +152,13 @@ or from multipage mode in the app sidebar (`pages/1_Admin.py`).
 
 - Passwords are stored as PBKDF2-SHA256 hashes (not plaintext).
 - Legacy plaintext rows are migrated to hashed passwords automatically on successful login.
+- Admin page access requires:
+  - normal app login
+  - username included in `admin_allowlist` (if configured)
+  - `admin_pass` input
 - Keep `.streamlit/secrets.toml` out of git (already ignored).
+- For deployment, store secrets in Streamlit Cloud Secrets only (do not commit local secret files).
+- If service-account credentials were ever exposed, revoke and reissue the key immediately.
 
 ## Tests
 

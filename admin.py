@@ -6,7 +6,7 @@ import datetime as dt
 
 import streamlit as st
 
-from auth import get_repo
+from auth import get_repo, login_guard, render_user_badge
 from storage.gsheets import NeuroGSheets  # repo.db 접근용 (records/raw)
 from storage.repo import NeuroRepo
 
@@ -15,36 +15,59 @@ from storage.repo import NeuroRepo
 # Admin gate
 # ----------------------------
 
-def _admin_gate() -> None:
-    st.title("NeuroFrame Admin")
+def _parse_allowlist(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if isinstance(raw, str):
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    return []
 
-    # 1) secrets에서 비번을 "어느 구조든" 가져오기
+
+def _load_admin_policy() -> tuple[str, List[str]]:
     secret = None
     if "admin_pass" in st.secrets:
         secret = st.secrets["admin_pass"]
     elif "admin" in st.secrets and "admin_pass" in st.secrets["admin"]:
         secret = st.secrets["admin"]["admin_pass"]
-
     if secret is None:
-        st.error("admin_pass가 secrets에 없습니다. (admin_pass 또는 [admin].admin_pass)")
+        raise RuntimeError("admin_pass가 secrets에 없습니다. (admin_pass 또는 [admin].admin_pass)")
+
+    allow_raw = None
+    if "admin_allowlist" in st.secrets:
+        allow_raw = st.secrets["admin_allowlist"]
+    elif "admin" in st.secrets and "allowlist" in st.secrets["admin"]:
+        allow_raw = st.secrets["admin"]["allowlist"]
+    allowlist = _parse_allowlist(allow_raw)
+    return str(secret).strip(), allowlist
+
+
+def _admin_gate(repo: NeuroRepo):
+    st.title("NeuroFrame Admin")
+    auth = login_guard(repo, title="관리자 로그인")
+    user = auth.user
+    assert user is not None
+    render_user_badge(user)
+
+    try:
+        secret, allowlist = _load_admin_policy()
+    except RuntimeError as e:
+        st.error(str(e))
         st.stop()
 
-    secret = str(secret).strip()
+    if allowlist and user.username not in allowlist:
+        st.error("관리자 권한이 없는 계정입니다.")
+        st.stop()
 
-    # 2) 입력값 공백 제거 + 문자열 강제
     st.sidebar.header("관리자 인증")
     pw = st.sidebar.text_input("Admin Pass", type="password")
     pw = str(pw or "").strip()
 
-    # 3) 디버그(비밀번호 내용은 노출 안 함): 키 존재/길이만 표시
-    with st.sidebar.expander("디버그(안전)"):
-        st.write("secrets keys:", list(st.secrets.keys()))
-        st.write("admin_pass loaded:", bool(secret))
-        st.write("admin_pass length:", len(secret))
-
     if pw != secret:
         st.info("관리자 비밀번호를 입력해주세요.")
         st.stop()
+    return user
 
 
 
@@ -97,11 +120,28 @@ def render_admin_page(repo: NeuroRepo, spreadsheet_name: str = "NeuroFrame_DB") 
       - edit baseline/weights
       - view recent daily logs
     """
-    _admin_gate()
+    admin_user = _admin_gate(repo)
 
     # We want direct access to sheets for bulk listing
     # repo.db is NeuroGSheets instance
     db: NeuroGSheets = repo.db  # type: ignore
+
+    st.caption(f"관리자 세션: `{admin_user.username}`")
+    st.caption("운영 전용 페이지입니다. 의료 조언을 제공하지 않습니다.")
+
+    st.divider()
+    st.subheader("보안 상태")
+    pw_stat = repo.count_password_rows()
+    csec1, csec2, csec3, csec4 = st.columns(4)
+    csec1.metric("users 총계", str(pw_stat.get("total", 0)))
+    csec2.metric("해시 저장", str(pw_stat.get("hashed", 0)))
+    csec3.metric("평문 잔존", str(pw_stat.get("plaintext", 0)))
+    csec4.metric("비어있음", str(pw_stat.get("empty", 0)))
+
+    if st.button("평문 비밀번호 일괄 해시 마이그레이션", use_container_width=True):
+        migrated = repo.migrate_plaintext_passwords()
+        st.success(f"{migrated}개 계정을 해시로 변환했습니다.")
+        st.rerun()
 
     st.subheader("유저 목록")
     users = _fetch_all_users(db)

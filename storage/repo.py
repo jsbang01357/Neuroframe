@@ -46,6 +46,12 @@ class NeuroRepo:
         # patch keys should match sheet headers
         return self.db.upsert_user_baseline(username, patch)
 
+    def count_password_rows(self) -> Dict[str, int]:
+        return self.db.count_password_rows()
+
+    def migrate_plaintext_passwords(self) -> int:
+        return self.db.migrate_plaintext_passwords()
+
     # ---- daily log ----
     def get_daily_log(self, username: str, date: dt.date) -> Optional[Dict[str, Any]]:
         return self.db.get_daily_log(username, date)

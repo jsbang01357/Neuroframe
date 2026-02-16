@@ -1,9 +1,10 @@
 # storage/repo.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 import datetime as dt
+import json
 
 from neuroframe.engine import UserBaseline
 
@@ -15,6 +16,7 @@ class RepoUser:
     baseline: UserBaseline
     is_shift_worker: bool = False
     uses_adhd_medication: bool = False
+    medication_tags: Dict[str, bool] = field(default_factory=dict)
 
 
 class NeuroRepo:
@@ -65,12 +67,14 @@ class NeuroRepo:
         onboarded = bool(self.db.user_to_baseline_dict(row).get("onboarded", False))
         is_shift_worker = str(row.get("is_shift_worker", "false")).strip().lower() in ("1", "true", "t", "yes", "y")
         uses_adhd_medication = str(row.get("uses_adhd_medication", "false")).strip().lower() in ("1", "true", "t", "yes", "y")
+        tags = self._row_to_medication_tags(row)
         return RepoUser(
             username=username,
             onboarded=onboarded,
             baseline=b,
             is_shift_worker=is_shift_worker,
             uses_adhd_medication=uses_adhd_medication,
+            medication_tags=tags,
         )
 
     def update_user_baseline(self, username: str, patch: Dict[str, Any]) -> bool:
@@ -145,6 +149,21 @@ class NeuroRepo:
         except Exception:
             return []
 
+    # ---- privacy / portability ----
+    def export_user_data(self, username: str) -> Dict[str, Any]:
+        try:
+            return self.db.export_user_data(username)
+        except Exception as e:
+            self._audit_error("export_user_data", username, e)
+            return {"exported_at": "", "username": username, "user": {}, "daily_logs": [], "checkins": []}
+
+    def delete_user_data(self, username: str, anonymize: bool = False) -> Dict[str, int]:
+        try:
+            return self.db.delete_user_data(username, anonymize=anonymize)
+        except Exception as e:
+            self._audit_error("delete_user_data", username, e)
+            raise RuntimeError(f"사용자 데이터 삭제 실패: {e}") from e
+
     # ---- internal ----
     def _row_to_baseline(self, row: Dict[str, Any]) -> UserBaseline:
         d = self.db.user_to_baseline_dict(row)
@@ -167,3 +186,28 @@ class NeuroRepo:
             drug_weight=float(d.get("drug_weight", 0.004)),
             load_weight=float(d.get("load_weight", 0.2)),
         )
+
+    def _row_to_medication_tags(self, row: Dict[str, Any]) -> Dict[str, bool]:
+        default_tags = {
+            "atomoxetine": False,
+            "ssri": False,
+            "aripiprazole": False,
+            "beta_blocker": False,
+        }
+        raw = row.get("profile_json", "")
+        if raw:
+            try:
+                obj = json.loads(str(raw))
+            except Exception:
+                obj = {}
+            if isinstance(obj, dict):
+                out = dict(default_tags)
+                for k in default_tags:
+                    out[k] = bool(obj.get(k, False))
+                return out
+
+        # Fallback for installations that may store these as separate columns.
+        out = dict(default_tags)
+        for k in default_tags:
+            out[k] = str(row.get(k, "false")).strip().lower() in ("1", "true", "t", "yes", "y")
+        return out

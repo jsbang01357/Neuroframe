@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Callable, List, Dict, Any, Optional, Tuple
 import math
 import datetime as dt
 
@@ -53,6 +53,7 @@ class DayInputs:
     sleep_override: Optional[Tuple[dt.datetime, dt.datetime]] = None
     doses: Optional[List[Dose]] = None
     workload_level: float = 0.0  # constant daily load
+    shift_blocks: Optional[List[Tuple[dt.datetime, dt.datetime, str]]] = None
 
 
 @dataclass
@@ -139,7 +140,14 @@ def sleep_pressure_signal(t: dt.datetime, wake_dt: dt.datetime, sleep_dt: dt.dat
     return _clip(awake_h / H, 0.0, 1.2)  # allow slight >1 for late nights
 
 def _dose_type(d: Dose) -> str:
-    return str(getattr(d, "dose_type", "caffeine") or "caffeine").strip().lower()
+    raw = str(getattr(d, "dose_type", "caffeine") or "caffeine").strip().lower()
+    if raw == "stimulant_ir":
+        return "mph_ir"
+    if raw == "stimulant_xr":
+        return "mph_xr"
+    if raw in ("caffeine", "mph_ir", "mph_xr"):
+        return raw
+    return "caffeine"
 
 
 def _caffeine_effect_single(
@@ -169,18 +177,66 @@ def _mph_ir_effect_single(t: dt.datetime, d: Dose) -> float:
 
 
 def _mph_xr_effect_single(t: dt.datetime, d: Dose) -> float:
-    # Slower rise + plateau + gradual decline (heuristic).
-    start = d.time + dt.timedelta(minutes=45)
-    if t < start:
+    # Two-phase release heuristic:
+    # 30% immediate + 70% delayed (~4h).
+    d_immediate = Dose(time=d.time, amount_mg=d.amount_mg * 0.30, dose_type="mph_ir")
+    d_delayed = Dose(time=d.time + dt.timedelta(hours=4), amount_mg=d.amount_mg * 0.70, dose_type="mph_ir")
+    return _mph_ir_effect_single(t, d_immediate) + _mph_ir_effect_single(t, d_delayed)
+
+
+DrugEffectFn = Callable[[dt.datetime, Dose, UserBaseline], float]
+ReboundWindowFn = Callable[[Dose], Optional[Tuple[dt.datetime, dt.datetime]]]
+
+
+def _caffeine_effect_model(t: dt.datetime, d: Dose, baseline: UserBaseline) -> float:
+    return _caffeine_effect_single(
+        t,
+        d,
+        half_life_hours=baseline.caffeine_half_life_hours,
+        sensitivity=baseline.caffeine_sensitivity,
+    )
+
+
+def _mph_ir_effect_model(t: dt.datetime, d: Dose, baseline: UserBaseline) -> float:
+    _ = baseline
+    return _mph_ir_effect_single(t, d)
+
+
+def _mph_xr_effect_model(t: dt.datetime, d: Dose, baseline: UserBaseline) -> float:
+    _ = baseline
+    return _mph_xr_effect_single(t, d)
+
+
+def _no_rebound_window(d: Dose) -> Optional[Tuple[dt.datetime, dt.datetime]]:
+    _ = d
+    return None
+
+
+def _mph_ir_rebound_window(d: Dose) -> Optional[Tuple[dt.datetime, dt.datetime]]:
+    return (d.time + dt.timedelta(hours=4.0), d.time + dt.timedelta(hours=7.0))
+
+
+def _mph_xr_rebound_window(d: Dose) -> Optional[Tuple[dt.datetime, dt.datetime]]:
+    return (d.time + dt.timedelta(hours=8.0), d.time + dt.timedelta(hours=12.0))
+
+
+DRUG_MODEL_REGISTRY: Dict[str, Tuple[DrugEffectFn, ReboundWindowFn]] = {
+    "caffeine": (_caffeine_effect_model, _no_rebound_window),
+    "mph_ir": (_mph_ir_effect_model, _mph_ir_rebound_window),
+    "mph_xr": (_mph_xr_effect_model, _mph_xr_rebound_window),
+}
+
+
+def _dose_effect_at_time(t: dt.datetime, d: Dose, baseline: UserBaseline) -> float:
+    typ = _dose_type(d)
+    effect_fn = DRUG_MODEL_REGISTRY.get(typ, DRUG_MODEL_REGISTRY["caffeine"])[0]
+    return effect_fn(t, d, baseline)
+
+
+def _total_drug_effect_at_time(t: dt.datetime, doses: List[Dose], baseline: UserBaseline) -> float:
+    if not doses:
         return 0.0
-    dh = (t - start).total_seconds() / 3600.0
-    if dh < 2.0:
-        profile = dh / 2.0
-    elif dh < 6.0:
-        profile = 1.0
-    else:
-        profile = math.exp(-(dh - 6.0) / 3.5)
-    return d.amount_mg * profile * 2.2
+    return sum(_dose_effect_at_time(t, d, baseline) for d in doses)
 
 
 def stimulant_effect(
@@ -190,46 +246,25 @@ def stimulant_effect(
     caffeine_sensitivity: float = 1.0,
 ) -> float:
     """
-    Combined stimulant effect:
-    - caffeine: exponential decay
-    - mph_ir: quick rise + short decay
-    - mph_xr: slow rise + plateau + gradual decay
+    Backward-compatible wrapper. Internal path uses the drug registry.
     """
-    if not doses:
-        return 0.0
-    total = 0.0
-    for d in doses:
-        typ = _dose_type(d)
-        if typ == "caffeine":
-            total += _caffeine_effect_single(
-                t,
-                d,
-                half_life_hours=caffeine_half_life_hours,
-                sensitivity=caffeine_sensitivity,
-            )
-        elif typ in ("mph_ir", "stimulant_ir"):
-            total += _mph_ir_effect_single(t, d)
-        elif typ in ("mph_xr", "stimulant_xr"):
-            total += _mph_xr_effect_single(t, d)
-        else:
-            # Unknown types are treated as caffeine-like for backward safety.
-            total += _caffeine_effect_single(
-                t,
-                d,
-                half_life_hours=caffeine_half_life_hours,
-                sensitivity=caffeine_sensitivity,
-            )
-    return total
+    baseline = UserBaseline(
+        baseline_sleep_start=dt.time(23, 30),
+        baseline_wake=dt.time(7, 30),
+        caffeine_half_life_hours=caffeine_half_life_hours,
+        caffeine_sensitivity=caffeine_sensitivity,
+    )
+    return _total_drug_effect_at_time(t, doses, baseline)
 
 
 def _rebound_windows(doses: List[Dose]) -> List[Tuple[dt.datetime, dt.datetime]]:
     windows: List[Tuple[dt.datetime, dt.datetime]] = []
     for d in doses:
         typ = _dose_type(d)
-        if typ in ("mph_ir", "stimulant_ir"):
-            windows.append((d.time + dt.timedelta(hours=4.0), d.time + dt.timedelta(hours=7.0)))
-        elif typ in ("mph_xr", "stimulant_xr"):
-            windows.append((d.time + dt.timedelta(hours=8.0), d.time + dt.timedelta(hours=12.0)))
+        rebound_fn = DRUG_MODEL_REGISTRY.get(typ, DRUG_MODEL_REGISTRY["caffeine"])[1]
+        window = rebound_fn(d)
+        if window is not None:
+            windows.append(window)
     return windows
 
 
@@ -242,11 +277,59 @@ def _rebound_mask(t_grid: List[dt.datetime], doses: List[Dose]) -> List[bool]:
         mask.append(any(s <= t < e for (s, e) in windows))
     return mask
 
-def load_signal_constant(workload_level: float) -> float:
+def _shift_load_boost(shift_type: str) -> float:
+    typ = str(shift_type or "shift").strip().lower()
+    if typ == "day":
+        return 0.60
+    if typ == "evening":
+        return 0.70
+    if typ == "night":
+        return 1.00
+    if typ == "call24":
+        return 1.20
+    return 0.70
+
+
+def _post_shift_boost(shift_type: str) -> float:
+    typ = str(shift_type or "shift").strip().lower()
+    if typ in ("night", "call24"):
+        return 0.40
+    return 0.25
+
+
+def load_signal_with_shifts(
+    t: dt.datetime,
+    workload_level: float,
+    shift_blocks: Optional[List[Tuple[dt.datetime, dt.datetime, str]]] = None,
+) -> float:
     """
-    Constant daily load. Keep it dead simple for MVP.
+    Shift-aware load signal:
+    - no shift blocks: slightly lower than base (off-day profile)
+    - pre-shift (2h): prep load bump
+    - in-shift: elevated load by shift type
+    - post-shift (2h): residual fatigue bump
     """
-    return max(0.0, workload_level)
+    base = max(0.0, workload_level)
+    blocks = shift_blocks or []
+    if not blocks:
+        return _clip(base * 0.90, 0.0, 4.0)
+
+    in_shift_boost = 0.0
+    prep_boost = 0.0
+    recovery_boost = 0.0
+    for s, e, typ in blocks:
+        if s <= t < e:
+            in_shift_boost = max(in_shift_boost, _shift_load_boost(typ))
+        if (s - dt.timedelta(hours=2)) <= t < s:
+            prep_boost = max(prep_boost, 0.20)
+        if e <= t < (e + dt.timedelta(hours=2)):
+            recovery_boost = max(recovery_boost, _post_shift_boost(typ))
+
+    load = base * 0.85
+    if in_shift_boost > 0:
+        load = base + in_shift_boost
+    load += prep_boost + recovery_boost
+    return _clip(load, 0.0, 4.0)
 
 
 # ----------------------------
@@ -293,19 +376,13 @@ def predict_day(
     load = []
     raw = []
 
-    # Precompute constant load for speed
-    Lc = load_signal_constant(day.workload_level)
+    shift_blocks = day.shift_blocks or []
 
     for t in t_grid:
         c = circadian_signal(t, wake_dt, baseline.chronotype_shift_hours)
         s = sleep_pressure_signal(t, wake_dt, sleep_dt, H=sleep_pressure_H)
-        d = stimulant_effect(
-            t,
-            doses=doses,
-            caffeine_half_life_hours=baseline.caffeine_half_life_hours,
-            caffeine_sensitivity=baseline.caffeine_sensitivity,
-        )
-        l = Lc
+        d = _total_drug_effect_at_time(t, doses=doses, baseline=baseline)
+        l = load_signal_with_shifts(t, day.workload_level, shift_blocks=shift_blocks)
 
         # Weighted raw net
         net_raw = (
@@ -372,6 +449,7 @@ def predict_day(
             "stimulant_types": sorted(set(stimulant_types)),
         },
         "rebound_windows": [(s.isoformat(), e.isoformat()) for (s, e) in rebound_windows],
+        "shift_blocks_count": len(shift_blocks),
     }
 
     return CurveOutput(

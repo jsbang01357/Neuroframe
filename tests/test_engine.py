@@ -89,6 +89,60 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(any(out.zones["rebound_candidate"]))
         self.assertTrue(any(out.zones["crash"]))
 
+    def test_shift_blocks_raise_load_during_shift_window(self):
+        tz = ZoneInfo("Asia/Seoul")
+        baseline = UserBaseline(
+            baseline_sleep_start=dt.time(23, 30),
+            baseline_wake=dt.time(7, 30),
+            sleep_pressure_weight=1.2,
+            drug_weight=0.004,
+            load_weight=0.2,
+        )
+        day = DayInputs(
+            date=dt.date(2026, 2, 15),
+            timezone=tz,
+            doses=[],
+            workload_level=1.0,
+            shift_blocks=[
+                (
+                    dt.datetime(2026, 2, 15, 8, 0, tzinfo=tz),
+                    dt.datetime(2026, 2, 15, 18, 0, tzinfo=tz),
+                    "day",
+                )
+            ],
+        )
+        out = predict_day(baseline, day, step_minutes=10)
+        in_shift_load = []
+        off_shift_load = []
+        for t, l in zip(out.t, out.load):
+            if 8 <= t.hour < 18:
+                in_shift_load.append(l)
+            if 2 <= t.hour < 4:
+                off_shift_load.append(l)
+        self.assertGreater(sum(in_shift_load) / len(in_shift_load), sum(off_shift_load) / len(off_shift_load))
+
+    def test_mph_xr_rebound_window_is_marked_in_expected_range(self):
+        tz = ZoneInfo("Asia/Seoul")
+        baseline = UserBaseline(
+            baseline_sleep_start=dt.time(23, 30),
+            baseline_wake=dt.time(7, 30),
+            sleep_pressure_weight=1.2,
+            drug_weight=0.004,
+            load_weight=0.2,
+        )
+        day = DayInputs(
+            date=dt.date(2026, 2, 15),
+            timezone=tz,
+            doses=[
+                Dose(time=dt.datetime(2026, 2, 15, 9, 0, tzinfo=tz), amount_mg=27.0, dose_type="mph_xr"),
+            ],
+            workload_level=1.0,
+        )
+        out = predict_day(baseline, day, step_minutes=10)
+        # mph_xr rebound heuristic: +8h ~ +12h => 17:00 ~ 21:00 for 09:00 dose
+        marked_hours = [t.hour for t, m in zip(out.t, out.zones.get("rebound_candidate", [])) if m]
+        self.assertTrue(any(h in (17, 18, 19, 20) for h in marked_hours))
+
 
 if __name__ == "__main__":
     unittest.main()

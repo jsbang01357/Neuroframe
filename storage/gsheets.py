@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 import datetime as dt
+import json
 import random
 import time
 
@@ -24,6 +25,7 @@ class GSheetsConfig:
     logs_ws: str = "daily_logs"
     checkins_ws: str = "checkins"
     admin_logs_ws: str = "admin_logs"
+    schema_version: str = "3"
 
     # Required columns (MVP)
     # users:
@@ -77,17 +79,17 @@ def _is_retryable_api_error(exc: Exception) -> bool:
 
 
 def _with_retry(op: str, fn, attempts: int = 4, base_delay: float = 0.25):
-    last_err: Optional[Exception] = None
     for i in range(max(1, attempts)):
         try:
             return fn()
         except Exception as e:
-            last_err = e
+            # Keep original exception types (e.g., WorksheetNotFound),
+            # so caller-specific fallback logic can still work.
             if i >= attempts - 1 or not _is_retryable_api_error(e):
-                break
+                raise
             delay = base_delay * (2 ** i) + random.uniform(0.0, 0.15)
             time.sleep(delay)
-    raise RuntimeError(f"GSheets operation failed: {op}: {last_err}") from last_err
+    raise RuntimeError(f"GSheets operation failed: {op}")
 
 def _ensure_headers(ws, headers: List[str]):
     """Ensure worksheet has required headers (append missing columns)."""
@@ -219,6 +221,7 @@ class NeuroGSheets:
 
     def _init_schema(self):
         users_headers = [
+            "schema_version",
             "username", "password", "created_at", "last_login",
             "baseline_sleep_start", "baseline_wake",
             "chronotype_shift_hours",
@@ -226,20 +229,24 @@ class NeuroGSheets:
             "baseline_offset",
             "circadian_weight", "sleep_pressure_weight", "drug_weight", "load_weight",
             "is_shift_worker", "uses_adhd_medication",
+            "profile_json",
             "onboarded",
         ]
         logs_headers = [
+            "schema_version",
             "date", "username",
             "sleep_override_on", "sleep_cross_midnight",
             "sleep_start", "wake_time",
             "doses_json",
             "shift_blocks_json",
+            "task_done_json",
             "day_shift_hours",
             "workload_level",
             "subjective_clarity",
             "updated_at",
         ]
         checkins_headers = [
+            "schema_version",
             "date", "username",
             "subjective_clarity",
             "focus_success",
@@ -249,6 +256,7 @@ class NeuroGSheets:
             "updated_at",
         ]
         admin_logs_headers = [
+            "schema_version",
             "timestamp",
             "level",
             "action",
@@ -259,6 +267,46 @@ class NeuroGSheets:
         _ensure_headers(self.logs, logs_headers)
         _ensure_headers(self.checkins, checkins_headers)
         _ensure_headers(self.admin_logs, admin_logs_headers)
+        self._migrate_schema_versions()
+        self._audit_schema_mismatch(self.users, users_headers, "users")
+        self._audit_schema_mismatch(self.logs, logs_headers, "daily_logs")
+        self._audit_schema_mismatch(self.checkins, checkins_headers, "checkins")
+        self._audit_schema_mismatch(self.admin_logs, admin_logs_headers, "admin_logs")
+
+    def _audit_schema_mismatch(self, ws, expected_headers: List[str], ws_name: str) -> None:
+        try:
+            current = _with_retry(f"row_values({ws_name}_header)", lambda: ws.row_values(1))
+        except Exception as e:
+            self.append_admin_log("error", "schema_header_read_failed", "", f"{ws_name}: {e}")
+            return
+        missing = [h for h in expected_headers if h not in current]
+        extra = [h for h in current if h not in expected_headers]
+        if missing or extra:
+            self.append_admin_log(
+                "warning",
+                "schema_mismatch",
+                "",
+                f"{ws_name} missing={missing} extra={extra}",
+            )
+
+    def _migrate_schema_versions(self) -> None:
+        target = str(self.cfg.schema_version)
+        for ws, cache_prefix, ws_name in (
+            (self.users, "users:", "users"),
+            (self.logs, "logs:", "daily_logs"),
+            (self.checkins, "checkins:", "checkins"),
+            (self.admin_logs, "admin_logs:", "admin_logs"),
+        ):
+            rows = _get_all_records(ws)
+            changed = 0
+            for i, r in enumerate(rows, start=2):
+                if str(r.get("schema_version", "") or "").strip() == target:
+                    continue
+                _update_row_dict(ws, i, {"schema_version": target})
+                changed += 1
+            if changed > 0:
+                self._cache_invalidate(cache_prefix)
+                self.append_admin_log("info", "schema_migrated", "", f"{ws_name}: updated_rows={changed} version={target}")
 
     # -------- Users --------
 
@@ -274,6 +322,7 @@ class NeuroGSheets:
         if self.get_user(username) is not None:
             return False
         data = {
+            "schema_version": str(self.cfg.schema_version),
             "username": username,
             "password": hash_password(password),
             "created_at": _now_iso(),
@@ -290,6 +339,15 @@ class NeuroGSheets:
             "load_weight": "0.2",
             "is_shift_worker": "false",
             "uses_adhd_medication": "false",
+            "profile_json": json.dumps(
+                {
+                    "atomoxetine": False,
+                    "ssri": False,
+                    "aripiprazole": False,
+                    "beta_blocker": False,
+                },
+                ensure_ascii=False,
+            ),
             "onboarded": "false",
         }
         _append_row_dict(self.users, data)
@@ -428,6 +486,7 @@ class NeuroGSheets:
 
         payload = {"date": date_s, "username": username, "updated_at": _now_iso()}
         payload.update(data)
+        payload.setdefault("schema_version", str(self.cfg.schema_version))
 
         if not found_rows:
             _append_row_dict(self.logs, payload)
@@ -477,6 +536,7 @@ class NeuroGSheets:
 
         payload = {"date": date_s, "username": username, "updated_at": _now_iso()}
         payload.update(data)
+        payload.setdefault("schema_version", str(self.cfg.schema_version))
         if not found_rows:
             _append_row_dict(self.checkins, payload)
         else:
@@ -487,6 +547,7 @@ class NeuroGSheets:
 
     def append_admin_log(self, level: str, action: str, username: str, detail: str) -> None:
         payload = {
+            "schema_version": str(self.cfg.schema_version),
             "timestamp": _now_iso(),
             "level": str(level or "info"),
             "action": str(action or ""),
@@ -505,3 +566,70 @@ class NeuroGSheets:
         out = list(rows)
         out.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
         return out[: max(0, int(limit))]
+
+    # -------- Privacy / data portability --------
+
+    def export_user_data(self, username: str) -> Dict[str, Any]:
+        user = self.get_user(username) or {}
+        if user:
+            user = dict(user)
+            # Never export password hash in portability payload.
+            user.pop("password", None)
+        logs = self.get_daily_logs_for_user(username, limit=None)
+        checkins = self.get_checkins_for_user(username, limit=None)
+        return {
+            "exported_at": _now_iso(),
+            "schema_version": str(self.cfg.schema_version),
+            "username": username,
+            "user": user,
+            "daily_logs": logs,
+            "checkins": checkins,
+        }
+
+    def delete_user_data(self, username: str, anonymize: bool = False) -> Dict[str, int]:
+        uname = str(username).strip()
+        if not uname:
+            return {"users": 0, "daily_logs": 0, "checkins": 0}
+
+        users_rows = _get_all_records(self.users)
+        logs_rows = _get_all_records(self.logs)
+        check_rows = _get_all_records(self.checkins)
+
+        user_idx = [i for i, r in enumerate(users_rows, start=2) if str(r.get("username", "")).strip() == uname]
+        log_idx = [i for i, r in enumerate(logs_rows, start=2) if str(r.get("username", "")).strip() == uname]
+        check_idx = [i for i, r in enumerate(check_rows, start=2) if str(r.get("username", "")).strip() == uname]
+
+        if anonymize:
+            anon_name = f"deleted_user_{int(time.time())}"
+            for i in user_idx:
+                _update_row_dict(
+                    self.users,
+                    i,
+                    {
+                        "username": anon_name,
+                        "password": "",
+                        "onboarded": "false",
+                    },
+                )
+            for i in log_idx:
+                _update_row_dict(self.logs, i, {"username": anon_name})
+            for i in check_idx:
+                _update_row_dict(self.checkins, i, {"username": anon_name})
+        else:
+            for i in sorted(user_idx, reverse=True):
+                _with_retry("delete_rows(users)", lambda idx=i: self.users.delete_rows(idx))
+            for i in sorted(log_idx, reverse=True):
+                _with_retry("delete_rows(logs)", lambda idx=i: self.logs.delete_rows(idx))
+            for i in sorted(check_idx, reverse=True):
+                _with_retry("delete_rows(checkins)", lambda idx=i: self.checkins.delete_rows(idx))
+
+        self._cache_invalidate("users:")
+        self._cache_invalidate("logs:")
+        self._cache_invalidate("checkins:")
+        self.append_admin_log(
+            "warning",
+            "user_data_deleted" if not anonymize else "user_data_anonymized",
+            uname,
+            f"users={len(user_idx)} logs={len(log_idx)} checkins={len(check_idx)}",
+        )
+        return {"users": len(user_idx), "daily_logs": len(log_idx), "checkins": len(check_idx)}

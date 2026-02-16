@@ -4,7 +4,7 @@ import datetime as dt
 import unittest
 from zoneinfo import ZoneInfo
 
-from neuroframe.engine import DayInputs, UserBaseline, calibrate_baseline_offset, predict_day
+from neuroframe.engine import DayInputs, Dose, UserBaseline, calibrate_baseline_offset, predict_day
 
 
 class EngineTests(unittest.TestCase):
@@ -66,7 +66,29 @@ class EngineTests(unittest.TestCase):
         self.assertGreater(raised, 0.0)
         self.assertLess(lowered, 0.0)
 
+    def test_predict_day_marks_rebound_candidate_for_mph(self):
+        tz = ZoneInfo("Asia/Seoul")
+        baseline = UserBaseline(
+            baseline_sleep_start=dt.time(23, 30),
+            baseline_wake=dt.time(7, 30),
+            drug_weight=0.004,
+            load_weight=0.2,
+            sleep_pressure_weight=1.2,
+        )
+        day = DayInputs(
+            date=dt.date(2026, 2, 15),
+            timezone=tz,
+            doses=[
+                Dose(time=dt.datetime(2026, 2, 15, 8, 0, tzinfo=tz), amount_mg=20.0, dose_type="mph_ir"),
+                Dose(time=dt.datetime(2026, 2, 15, 9, 0, tzinfo=tz), amount_mg=100.0, dose_type="caffeine"),
+            ],
+            workload_level=1.0,
+        )
+        out = predict_day(baseline, day, step_minutes=10)
+        self.assertIn("rebound_candidate", out.zones)
+        self.assertTrue(any(out.zones["rebound_candidate"]))
+        self.assertTrue(any(out.zones["crash"]))
+
 
 if __name__ == "__main__":
     unittest.main()
-

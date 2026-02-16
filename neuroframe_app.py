@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
 import json
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -19,6 +21,7 @@ from shared.today_input import (
     drafts_to_engine_doses,
     parse_sleep_override,
 )
+from shared.calendar_integration import CalendarEvent, fetch_google_calendar_events_for_day
 
 TZ = ZoneInfo("Asia/Seoul")
 
@@ -43,6 +46,9 @@ def init_session_defaults():
     st.session_state.setdefault("today_shift_blocks_json", "[]")
     st.session_state.setdefault("today_workload", 1.0)
     st.session_state.setdefault("today_clarity", 5.0)
+    st.session_state.setdefault("task_done_map", {})
+    st.session_state.setdefault("profile_is_shift_worker", False)
+    st.session_state.setdefault("profile_uses_adhd_medication", False)
 
     st.session_state.setdefault("morning_checkin_done_date", "")
 
@@ -81,9 +87,32 @@ def _safe_float(x: Any, default: float) -> float:
         return default
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_daily_logs_for_user(_repo, username: str, limit: int = 120) -> List[Dict[str, Any]]:
+    return _repo.get_daily_logs_for_user(username, limit=limit)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_daily_log(_repo, username: str, date_iso: str) -> Optional[Dict[str, Any]]:
+    d = dt.date.fromisoformat(date_iso)
+    return _repo.get_daily_log(username, d)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_checkin(_repo, username: str, date_iso: str) -> Optional[Dict[str, Any]]:
+    d = dt.date.fromisoformat(date_iso)
+    return _repo.get_checkin(username, d)
+
+
+def _invalidate_repo_read_caches() -> None:
+    _cached_daily_logs_for_user.clear()
+    _cached_daily_log.clear()
+    _cached_checkin.clear()
+
+
 def _recent_logs_window(repo, username: str, end_date: dt.date, days: int = 7) -> List[Dict[str, Any]]:
     start_date = end_date - dt.timedelta(days=days - 1)
-    logs = repo.get_daily_logs_for_user(username, limit=120)
+    logs = _cached_daily_logs_for_user(repo, username, 120)
     out: List[Dict[str, Any]] = []
     for r in logs:
         d = _parse_date_iso(r.get("date", ""))
@@ -178,11 +207,143 @@ def _minutes_to_hhmm(minutes: float) -> str:
     return f"{m // 60:02d}:{m % 60:02d}"
 
 
+def _badge_html(label: str, value: str, bg: str, fg: str = "#0b1220") -> str:
+    return (
+        f"<span style='display:inline-block;padding:6px 10px;margin:3px 6px 3px 0;"
+        f"border-radius:999px;background:{bg};color:{fg};font-size:0.88rem;font-weight:600;'>"
+        f"{label} · {value}</span>"
+    )
+
+
 def _sum_caffeine_mg(doses_json: str) -> float:
     total = 0.0
     for d in doses_from_json(doses_json):
-        total += max(0.0, float(d.amount_mg))
+        if str(getattr(d, "dose_type", "caffeine") or "caffeine").strip().lower() == "caffeine":
+            total += max(0.0, float(d.amount_mg))
     return total
+
+
+def _read_calendar_config() -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """
+    Returns (service_account_info, calendar_id, delegated_user).
+    calendar_id can be configured as:
+      - st.secrets["google_calendar_id"]
+      - st.secrets["calendar"]["id"]
+    delegated user can be configured as:
+      - st.secrets["google_calendar_delegated_user"]
+      - st.secrets["calendar"]["delegated_user"]
+    """
+    sa = None
+    if "gcp_service_account" in st.secrets:
+        sa = dict(st.secrets["gcp_service_account"])
+
+    calendar_id = ""
+    delegated = ""
+    if "google_calendar_id" in st.secrets:
+        calendar_id = str(st.secrets["google_calendar_id"] or "").strip()
+    elif "calendar" in st.secrets and "id" in st.secrets["calendar"]:
+        calendar_id = str(st.secrets["calendar"]["id"] or "").strip()
+
+    if "google_calendar_delegated_user" in st.secrets:
+        delegated = str(st.secrets["google_calendar_delegated_user"] or "").strip()
+    elif "calendar" in st.secrets and "delegated_user" in st.secrets["calendar"]:
+        delegated = str(st.secrets["calendar"]["delegated_user"] or "").strip()
+    return sa, calendar_id, delegated
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _cached_google_calendar_events(day_iso: str) -> List[CalendarEvent]:
+    sa, cal_id, delegated = _read_calendar_config()
+    if not sa or not cal_id:
+        return []
+    day = dt.date.fromisoformat(day_iso)
+    try:
+        return fetch_google_calendar_events_for_day(
+            service_account_info=sa,
+            calendar_id=cal_id,
+            day=day,
+            tz=TZ,
+            delegated_user=delegated,
+        )
+    except Exception:
+        return []
+
+
+def _invalidate_calendar_cache() -> None:
+    _cached_google_calendar_events.clear()
+
+
+def _ics_escape(s: str) -> str:
+    return str(s).replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
+
+
+def _blocks_to_ics_bytes(blocks) -> bytes:
+    now_utc = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//NeuroFrame//Schedule Export//EN",
+        "CALSCALE:GREGORIAN",
+    ]
+    for b in blocks:
+        start_utc = b.start.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        end_utc = b.end.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        uid = f"{uuid.uuid4()}@neuroframe"
+        lines.extend(
+            [
+                "BEGIN:VEVENT",
+                f"UID:{uid}",
+                f"DTSTAMP:{now_utc}",
+                f"DTSTART:{start_utc}",
+                f"DTEND:{end_utc}",
+                f"SUMMARY:{_ics_escape('NeuroFrame ' + b.label)}",
+                f"DESCRIPTION:{_ics_escape(b.rationale)}",
+                "END:VEVENT",
+            ]
+        )
+    lines.append("END:VCALENDAR")
+    return ("\r\n".join(lines) + "\r\n").encode("utf-8")
+
+
+def _weekly_report_pdf_bytes(
+    end_date: dt.date,
+    avg_prime_start_text: str,
+    avg_crash_len: float,
+    sleep_48h: float,
+    sleep_7d_avg: float,
+    sleep_debt_7d: float,
+    caffeine_total_mg: float,
+    recommendation: str,
+) -> bytes:
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    buf = io.BytesIO()
+    with PdfPages(buf) as pdf:
+        fig = plt.figure(figsize=(8.27, 11.69))
+        ax = fig.add_subplot(111)
+        ax.axis("off")
+        lines = [
+            "NeuroFrame Weekly Report",
+            f"기준일: {end_date.isoformat()}",
+            "",
+            f"Prime 평균 시작: {avg_prime_start_text}",
+            f"Crash 평균 길이: {avg_crash_len:.0f}분",
+            f"최근48h 수면: {sleep_48h:.1f}h",
+            f"7일 평균 수면: {sleep_7d_avg:.1f}h",
+            f"수면부채(7d): {sleep_debt_7d:.1f}h",
+            f"카페인 총량(7d): {caffeine_total_mg:.0f}mg",
+            "",
+            "추천",
+            recommendation,
+        ]
+        y = 0.95
+        for line in lines:
+            ax.text(0.05, y, line, fontsize=11, va="top", family="DejaVu Sans")
+            y -= 0.05
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+    return buf.getvalue()
 
 
 def _estimate_confidence(day_inputs: DayInputs, recent_logs_count: int) -> Tuple[str, int, List[str]]:
@@ -193,7 +354,7 @@ def _estimate_confidence(day_inputs: DayInputs, recent_logs_count: int) -> Tuple
         reasons.append("수면 오버라이드 미입력")
     if not (day_inputs.doses or []):
         score -= 12
-        reasons.append("카페인 입력 없음")
+        reasons.append("카페인/약물 입력 없음")
     if day_inputs.workload_level <= 0.0:
         score -= 8
         reasons.append("업무 부하가 0")
@@ -207,6 +368,47 @@ def _estimate_confidence(day_inputs: DayInputs, recent_logs_count: int) -> Tuple
     if score >= 50:
         return "중간", score, reasons
     return "낮음", score, reasons
+
+
+def _dose_type_label(v: str) -> str:
+    key = str(v or "caffeine").strip().lower()
+    if key == "mph_ir":
+        return "MPH IR"
+    if key == "mph_xr":
+        return "MPH XR"
+    return "Caffeine"
+
+
+def _render_stimulant_caffeine_notice(day_inputs: DayInputs):
+    doses = day_inputs.doses or []
+    has_stimulant = False
+    late_caffeine = False
+    for d in doses:
+        typ = str(getattr(d, "dose_type", "caffeine") or "caffeine").strip().lower()
+        if typ in ("mph_ir", "mph_xr", "stimulant_ir", "stimulant_xr"):
+            has_stimulant = True
+        if typ == "caffeine" and (d.time.hour >= 15):
+            late_caffeine = True
+
+    if has_stimulant and late_caffeine:
+        st.warning("오늘은 자극제 입력이 있어, 늦은 카페인은 Sleep Gate를 뒤로 미룰 수 있습니다. 가능한 이른 시간대로 조정하는 편이 유리할 수 있습니다.")
+    elif has_stimulant:
+        st.info("오늘은 자극제 입력이 있습니다. 추가 카페인은 필요 최소량을 이른 시간대에 배치하면 저녁 반동(rebound)과 수면 지연 가능성을 줄이는 데 도움이 될 수 있습니다.")
+
+
+def _task_key(date: dt.date, label: str, start: dt.datetime, end: dt.datetime) -> str:
+    return f"{date.isoformat()}::{label}::{start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
+
+
+def _is_task_done(task_key: str) -> bool:
+    done_map = st.session_state.get("task_done_map", {})
+    return bool(done_map.get(task_key, False))
+
+
+def _set_task_done(task_key: str, done: bool) -> None:
+    done_map = dict(st.session_state.get("task_done_map", {}))
+    done_map[task_key] = bool(done)
+    st.session_state["task_done_map"] = done_map
 
 
 def _shift_template_blocks(template: str) -> List[Dict[str, str]]:
@@ -280,6 +482,33 @@ def _overlap_minutes(a: Tuple[dt.datetime, dt.datetime], b: Tuple[dt.datetime, d
     return (e - s).total_seconds() / 60.0
 
 
+def render_calendar_conflicts(out):
+    st.subheader("Calendar 충돌")
+    events = _cached_google_calendar_events(st.session_state["today_date"].isoformat())
+    if not events:
+        st.caption("Google Calendar 연동이 없거나 오늘 일정이 없습니다.")
+        return
+
+    prime_spans = _mask_to_spans(out.t, out.zones.get("prime", []))
+    collisions: List[Tuple[CalendarEvent, float]] = []
+    for ev in events:
+        overlap = 0.0
+        for ps in prime_spans:
+            overlap += _overlap_minutes((ev.start, ev.end), ps)
+        if overlap > 0:
+            collisions.append((ev, overlap))
+
+    if not collisions:
+        st.success("오늘 Prime Zone과 겹치는 회의가 크지 않습니다.")
+        return
+
+    st.warning(f"Prime Zone과 겹치는 일정 {len(collisions)}건이 있습니다.")
+    for ev, ov in collisions[:5]:
+        tr = f"{ev.start.strftime('%H:%M')}–{ev.end.strftime('%H:%M')}"
+        st.write(f"- **{ev.summary}** ({tr}) · Prime 겹침 {ov:.0f}분")
+    st.info("이 구간은 Deep Work가 유리할 수 있는데, 이미 회의가 있습니다. 가능하면 회의를 이동하거나 Deep Work를 인접 구간으로 이동해보세요.")
+
+
 def _build_inputs_from_log_row(row: Dict[str, Any], date: dt.date) -> DayInputs:
     sleep_on = str(row.get("sleep_override_on", "false")).lower() == "true"
     cross_mid = str(row.get("sleep_cross_midnight", "true")).lower() == "true"
@@ -307,7 +536,7 @@ def _build_inputs_from_log_row(row: Dict[str, Any], date: dt.date) -> DayInputs:
 
 
 def _apply_recent_pattern(repo, username: str, target_date: dt.date) -> bool:
-    logs = repo.get_daily_logs_for_user(username, limit=120)
+    logs = _cached_daily_logs_for_user(repo, username, 120)
     candidates: List[Dict[str, Any]] = []
     for r in logs:
         d = _parse_date_iso(r.get("date", ""))
@@ -369,13 +598,13 @@ def _apply_recent_pattern(repo, username: str, target_date: dt.date) -> bool:
 def _add_preset_dose(drafts: List[DoseDraft], preset: str) -> List[DoseDraft]:
     new_drafts = list(drafts)
     if preset == "아메리카노(150mg)":
-        new_drafts.append(DoseDraft(9, 0, 150.0))
+        new_drafts.append(DoseDraft(9, 0, 150.0, "caffeine"))
     elif preset == "샷 추가(75mg)":
-        new_drafts.append(DoseDraft(13, 30, 75.0))
+        new_drafts.append(DoseDraft(13, 30, 75.0, "caffeine"))
     elif preset == "에너지드링크(120mg)":
-        new_drafts.append(DoseDraft(15, 0, 120.0))
+        new_drafts.append(DoseDraft(15, 0, 120.0, "caffeine"))
     elif preset == "디카페인(20mg)":
-        new_drafts.append(DoseDraft(16, 0, 20.0))
+        new_drafts.append(DoseDraft(16, 0, 20.0, "caffeine"))
     return new_drafts[:6]
 
 
@@ -383,10 +612,10 @@ def _plan_to_drafts(plan: str) -> List[DoseDraft]:
     if plan == "없음":
         return []
     if plan == "라이트":
-        return [DoseDraft(9, 0, 100.0)]
+        return [DoseDraft(9, 0, 100.0, "caffeine")]
     if plan == "보통":
-        return [DoseDraft(9, 0, 150.0), DoseDraft(14, 0, 70.0)]
-    return [DoseDraft(8, 30, 180.0), DoseDraft(13, 30, 120.0)]
+        return [DoseDraft(9, 0, 150.0, "caffeine"), DoseDraft(14, 0, 70.0, "caffeine")]
+    return [DoseDraft(8, 30, 180.0, "caffeine"), DoseDraft(13, 30, 120.0, "caffeine")]
 
 
 # ----------------------------
@@ -395,7 +624,7 @@ def _plan_to_drafts(plan: str) -> List[DoseDraft]:
 
 def load_today_state(repo, username: str):
     date = st.session_state["today_date"]
-    row = repo.get_daily_log(username, date)
+    row = _cached_daily_log(repo, username, date.isoformat())
     if not row:
         return
 
@@ -424,6 +653,7 @@ def save_today_state(repo, username: str):
         "subjective_clarity": str(st.session_state["today_clarity"]),
     }
     repo.upsert_daily_log(username, date, payload)
+    _invalidate_repo_read_caches()
 
 
 # ----------------------------
@@ -446,11 +676,22 @@ def render_setup_wizard(repo, username: str, baseline: UserBaseline):
     st.caption("최초 1회 설정입니다. 나중에 관리자/설정에서 언제든 수정할 수 있습니다.")
     st.info("안내: NeuroFrame은 의료 조언/진단/치료를 제공하지 않는 일정 설계 도구입니다.")
 
+    st.subheader("Step 0 — 프로필")
+    p1, p2 = st.columns(2)
+    with p1:
+        is_shift_worker = st.toggle("교대근무를 하나요?", value=bool(st.session_state.get("profile_is_shift_worker", False)))
+    with p2:
+        uses_adhd_med = st.toggle("ADHD 약물을 사용하나요?", value=bool(st.session_state.get("profile_uses_adhd_medication", False)))
+    st.session_state["profile_is_shift_worker"] = bool(is_shift_worker)
+    st.session_state["profile_uses_adhd_medication"] = bool(uses_adhd_med)
+
     st.subheader("Step 1 — Baseline")
     c1, c2, c3 = st.columns(3)
     with c1:
-        baseline_sleep_start = st.time_input("평균 취침", value=baseline.baseline_sleep_start)
-        baseline_wake = st.time_input("평균 기상", value=baseline.baseline_wake)
+        default_sleep = baseline.baseline_sleep_start if not is_shift_worker else dt.time(0, 30)
+        default_wake = baseline.baseline_wake if not is_shift_worker else dt.time(8, 0)
+        baseline_sleep_start = st.time_input("평균 취침", value=default_sleep)
+        baseline_wake = st.time_input("평균 기상", value=default_wake)
     with c2:
         chronoshift = st.number_input("크로노타입 시프트(시간)", value=float(baseline.chronotype_shift_hours), step=0.5)
     with c3:
@@ -462,7 +703,10 @@ def render_setup_wizard(repo, username: str, baseline: UserBaseline):
         caffeine_half_life = st.number_input("카페인 반감기(시간)", value=float(baseline.caffeine_half_life_hours), step=0.5)
         caffeine_sensitivity = st.number_input("카페인 민감도", value=float(baseline.caffeine_sensitivity), step=0.1)
     with c5:
-        st.caption("MVP는 카페인 중심입니다.")
+        if uses_adhd_med:
+            st.caption("약물 입력 폼에서 MPH IR/XR를 함께 설정할 수 있습니다.")
+        else:
+            st.caption("기본 입력은 카페인 중심으로 단순화됩니다.")
 
     st.subheader("Step 3 — 엔진 가중치")
     c6, c7, c8, c9 = st.columns(4)
@@ -487,6 +731,8 @@ def render_setup_wizard(repo, username: str, baseline: UserBaseline):
             "sleep_pressure_weight": str(float(w_s)),
             "drug_weight": str(float(w_d)),
             "load_weight": str(float(w_l)),
+            "is_shift_worker": "true" if is_shift_worker else "false",
+            "uses_adhd_medication": "true" if uses_adhd_med else "false",
             "onboarded": "true",
         }
         ok = repo.update_user_baseline(username, patch)
@@ -497,7 +743,7 @@ def render_setup_wizard(repo, username: str, baseline: UserBaseline):
             st.error("저장에 실패했습니다. users 시트/권한/헤더를 확인해주세요.")
 
 
-def render_morning_checkin(repo, username: str):
+def render_morning_checkin(repo, username: str, is_shift_worker: bool):
     now = dt.datetime.now(TZ)
     today = now.date()
     if st.session_state["today_date"] != today:
@@ -517,7 +763,9 @@ def render_morning_checkin(repo, username: str):
         sleep_start = st.time_input("실제 취침", value=st.session_state["today_sleep_start"], key="morning_sleep_start")
         wake_time = st.time_input("실제 기상", value=st.session_state["today_wake_time"], key="morning_wake_time")
     with c2:
-        shift_template = st.selectbox("Shift 템플릿", ["Off", "Day", "Evening", "Night", "24h-call"], index=0)
+        shift_template = "Off"
+        if is_shift_worker:
+            shift_template = st.selectbox("Shift 템플릿", ["Off", "Day", "Evening", "Night", "24h-call"], index=0)
         plan = st.selectbox("카페인 계획(대략)", ["없음", "라이트", "보통", "높음"], index=2)
         workload = st.slider("오늘 workload", 0.0, 3.0, value=float(st.session_state["today_workload"]), step=0.5)
 
@@ -531,13 +779,16 @@ def render_morning_checkin(repo, username: str):
         st.session_state["today_shift_hours"] = _template_shift_hours(shift_template)
         st.session_state["today_workload"] = float(workload)
 
-        save_today_state(repo, username)
-        st.session_state["morning_checkin_done_date"] = today.isoformat()
-        st.success("체크인 완료. 오늘 요약을 업데이트합니다.")
-        st.rerun()
+        try:
+            save_today_state(repo, username)
+            st.session_state["morning_checkin_done_date"] = today.isoformat()
+            st.success("체크인 완료. 오늘 요약을 업데이트합니다.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"아침 체크인 저장 실패: {e}")
 
 
-def render_edit_panel(repo, username: str):
+def render_edit_panel(repo, username: str, uses_adhd_medication: bool):
     st.sidebar.header("오늘 입력")
 
     date = st.sidebar.date_input("날짜", value=st.session_state["today_date"])
@@ -551,6 +802,17 @@ def render_edit_panel(repo, username: str):
             st.sidebar.success("최근 패턴으로 기본값을 채웠습니다.")
             st.rerun()
         st.sidebar.warning("참조할 최근 로그가 부족합니다.")
+
+    if st.sidebar.button("어제 카페인 입력 복사", use_container_width=True):
+        yesterday = st.session_state["today_date"] - dt.timedelta(days=1)
+        prev = _cached_daily_log(repo, username, yesterday.isoformat()) or {}
+        prev_doses = str(prev.get("doses_json", "[]") or "[]")
+        if prev_doses != "[]":
+            drafts = [d for d in doses_from_json(prev_doses) if str(getattr(d, "dose_type", "caffeine")).strip().lower() == "caffeine"]
+            st.session_state["today_doses_json"] = doses_to_json(st.session_state["today_date"], TZ, drafts)
+            st.sidebar.success("어제 카페인 패턴을 복사했습니다.")
+            st.rerun()
+        st.sidebar.info("어제 복사할 카페인 입력이 없습니다.")
 
     st.sidebar.subheader("Shift 템플릿")
     tcol1, tcol2, tcol3 = st.sidebar.columns(3)
@@ -596,10 +858,10 @@ def render_edit_panel(repo, username: str):
     else:
         st.sidebar.caption("기본값(온보딩 baseline)을 사용합니다.")
 
-    st.sidebar.subheader("카페인")
+    st.sidebar.subheader("자극제/카페인")
     drafts = doses_from_json(st.session_state["today_doses_json"])
     if not drafts:
-        drafts = [DoseDraft(9, 0, 150.0)]
+        drafts = [DoseDraft(9, 0, 150.0, "caffeine")]
 
     preset = st.sidebar.selectbox(
         "빠른 프리셋",
@@ -617,13 +879,24 @@ def render_edit_panel(repo, username: str):
     new_drafts: List[DoseDraft] = []
     for i in range(n):
         st.sidebar.markdown(f"**Dose {i + 1}**")
-        cc1, cc2 = st.sidebar.columns(2)
-        with cc1:
-            hour = st.number_input("시", 0, 23, value=int(drafts[i].hour), key=f"dose_h_{i}")
-            minute = st.number_input("분", 0, 59, value=int(drafts[i].minute), key=f"dose_m_{i}")
-        with cc2:
-            mg = st.number_input("mg", 0.0, 400.0, value=float(drafts[i].amount_mg), step=10.0, key=f"dose_mg_{i}")
-        new_drafts.append(DoseDraft(int(hour), int(minute), float(mg)))
+        hour = st.number_input("시", 0, 23, value=int(drafts[i].hour), key=f"dose_h_{i}")
+        minute = st.number_input("분", 0, 59, value=int(drafts[i].minute), key=f"dose_m_{i}")
+        mg = st.number_input("mg", 0.0, 400.0, value=float(drafts[i].amount_mg), step=10.0, key=f"dose_mg_{i}")
+        if uses_adhd_medication:
+            dose_type = st.selectbox(
+                "타입",
+                ["caffeine", "mph_ir", "mph_xr"],
+                index=["caffeine", "mph_ir", "mph_xr"].index(
+                    str(getattr(drafts[i], "dose_type", "caffeine") or "caffeine").strip().lower()
+                )
+                if str(getattr(drafts[i], "dose_type", "caffeine") or "caffeine").strip().lower() in ("caffeine", "mph_ir", "mph_xr")
+                else 0,
+                key=f"dose_type_{i}",
+                format_func=_dose_type_label,
+            )
+        else:
+            dose_type = "caffeine"
+        new_drafts.append(DoseDraft(int(hour), int(minute), float(mg), str(dose_type)))
 
     st.sidebar.subheader("오늘 shift 보정")
     st.session_state["today_shift_hours"] = st.sidebar.slider(
@@ -640,10 +913,13 @@ def render_edit_panel(repo, username: str):
 
     apply = st.sidebar.button("저장하고 적용", type="primary", use_container_width=True)
     if apply:
-        st.session_state["today_doses_json"] = doses_to_json(date, TZ, new_drafts)
-        save_today_state(repo, username)
-        st.session_state["edit_today_open"] = False
-        st.rerun()
+        try:
+            st.session_state["today_doses_json"] = doses_to_json(date, TZ, new_drafts)
+            save_today_state(repo, username)
+            st.session_state["edit_today_open"] = False
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"오늘 입력 저장 실패: {e}")
 
 
 def build_day_inputs() -> DayInputs:
@@ -674,25 +950,54 @@ def render_summary_cards(out):
     prime_spans = _mask_to_spans(out.t, out.zones.get("prime", []))
     crash_spans = _mask_to_spans(out.t, out.zones.get("crash", []))
     gate_spans = _mask_to_spans(out.t, out.zones.get("sleep_gate", []))
+    rebound_spans = _mask_to_spans(out.t, out.zones.get("rebound_candidate", []))
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     c1.metric("Prime", _primary_span_text(prime_spans))
     c2.metric("Crash", _primary_span_text(crash_spans))
+    c3, c4 = st.columns(2)
     c3.metric("Sleep Gate", _primary_span_text(gate_spans, sleep_gate=True))
+    c4.metric("Rebound 후보", _primary_span_text(rebound_spans))
+
+    badges = [
+        _badge_html("Prime", _primary_span_text(prime_spans), "#cdeccd"),
+        _badge_html("Crash", _primary_span_text(crash_spans), "#ffe1c4"),
+        _badge_html("Sleep Gate", _primary_span_text(gate_spans, sleep_gate=True), "#dbeafe"),
+    ]
+    st.markdown("".join(badges), unsafe_allow_html=True)
 
 
 def render_today_recommendations(out):
     st.subheader("오늘의 추천 3개")
     blocks = design_schedule(out, deep_work_target_minutes=120, max_blocks=6)
+    if not blocks:
+        st.caption("오늘은 추천 블록을 만들기 어렵습니다.")
+        return
 
-    by_label: Dict[str, Optional[str]] = {"Deep Work": None, "Low Load": None, "Wind-down": None}
-    for b in blocks:
-        if b.label in by_label and by_label[b.label] is None:
-            by_label[b.label] = f"{b.start.strftime('%H:%M')}–{b.end.strftime('%H:%M')}"
+    today = st.session_state["today_date"]
+    done = 0
+    for i, b in enumerate(blocks[:5], start=1):
+        time_range = f"{b.start.strftime('%H:%M')}–{b.end.strftime('%H:%M')}"
+        k = _task_key(today, b.label, b.start, b.end)
+        checked = st.checkbox(
+            f"{i}. {b.label} · {time_range}",
+            value=_is_task_done(k),
+            key=f"task_chk_{k}",
+        )
+        _set_task_done(k, checked)
+        if checked:
+            done += 1
+        st.caption(f"근거: {b.rationale}")
+    st.caption(f"완료 {done}/{min(len(blocks), 5)}")
 
-    st.write(f"- **Deep Work**: {by_label['Deep Work'] or '추천 시간 부족'}")
-    st.write(f"- **Low Load**: {by_label['Low Load'] or '추천 시간 부족'}")
-    st.write(f"- **Wind-down**: {by_label['Wind-down'] or '추천 시간 부족'}")
+    ics_bytes = _blocks_to_ics_bytes(blocks[:5])
+    st.download_button(
+        "추천 블록 iCal(.ics) 다운로드",
+        data=ics_bytes,
+        file_name=f"neuroframe_{st.session_state['today_date'].isoformat()}_blocks.ics",
+        mime="text/calendar",
+        use_container_width=True,
+    )
 
 
 def render_shift_aware_insights(out, shift_spans: List[Tuple[dt.datetime, dt.datetime, str]]):
@@ -817,8 +1122,12 @@ def render_tomorrow_plan(repo, username: str, baseline: UserBaseline):
             "workload_level": str(st.session_state["today_workload"]),
             "subjective_clarity": "",
         }
-        repo.upsert_daily_log(username, tomorrow, payload)
-        st.success("내일 daily_log 초안을 저장했습니다.")
+        try:
+            repo.upsert_daily_log(username, tomorrow, payload)
+            _invalidate_repo_read_caches()
+            st.success("내일 daily_log 초안을 저장했습니다.")
+        except Exception as e:
+            st.error(f"내일 계획 저장 실패: {e}")
 
 
 def render_daily_checkin(repo, username: str, baseline: UserBaseline, out):
@@ -826,7 +1135,7 @@ def render_daily_checkin(repo, username: str, baseline: UserBaseline, out):
     st.subheader("저녁 마감 체크인")
 
     date = st.session_state["today_date"]
-    existing = repo.get_checkin(username, date) or {}
+    existing = _cached_checkin(repo, username, date.isoformat()) or {}
 
     clarity_default = _safe_float(
         existing.get("subjective_clarity", existing.get("energy_satisfaction", st.session_state["today_clarity"])),
@@ -855,16 +1164,24 @@ def render_daily_checkin(repo, username: str, baseline: UserBaseline, out):
                 "notes": notes,
             },
         )
+        _invalidate_repo_read_caches()
 
     c3, c4 = st.columns(2)
     with c3:
         if st.button("체크인 저장", use_container_width=True):
-            _save_checkin()
-            st.success("체크인을 저장했습니다.")
+            try:
+                _save_checkin()
+                st.success("체크인을 저장했습니다.")
+            except Exception as e:
+                st.error(f"체크인 저장 실패: {e}")
 
     with c4:
         if st.button("체크인 저장 + 적응 업데이트", use_container_width=True):
-            _save_checkin()
+            try:
+                _save_checkin()
+            except Exception as e:
+                st.error(f"체크인 저장 실패: {e}")
+                return
 
             adjusted_clarity = float(clarity) + (0.5 if focus_success else -0.5)
             adjusted_clarity = _clip(adjusted_clarity, 0.0, 10.0)
@@ -915,7 +1232,7 @@ def render_weekly_report(repo, username: str, baseline: UserBaseline):
 
     end_date = st.session_state["today_date"]
     start_date = end_date - dt.timedelta(days=6)
-    logs = repo.get_daily_logs_for_user(username, limit=120)
+    logs = _cached_daily_logs_for_user(repo, username, 120)
 
     log_by_date: Dict[dt.date, Dict[str, Any]] = {}
     for r in logs:
@@ -981,9 +1298,10 @@ def render_weekly_report(repo, username: str, baseline: UserBaseline):
     avg_crash_len = sum(crash_lengths) / len(crash_lengths) if crash_lengths else 0.0
     sleep_7d_avg = sleep_7d_total / 7.0
     sleep_debt_7d = max(0.0, target_sleep_h * 7.0 - sleep_7d_total)
+    avg_prime_start_text = _minutes_to_hhmm(avg_prime_start) if avg_prime_start is not None else "-"
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Prime 평균 시작", _minutes_to_hhmm(avg_prime_start) if avg_prime_start is not None else "-")
+    c1.metric("Prime 평균 시작", avg_prime_start_text)
     c2.metric("Crash 평균 길이", f"{avg_crash_len:.0f}분")
     c3.metric("최근48h 수면", f"{sleep_48h:.1f}h")
     c4.metric("7일 평균 수면", f"{sleep_7d_avg:.1f}h")
@@ -1002,6 +1320,24 @@ def render_weekly_report(repo, username: str, baseline: UserBaseline):
         rec = "패턴이 비교적 안정적입니다. Prime 시작 30분 전 준비 루틴을 고정하면 효율이 더 오릅니다."
     st.write(f"- 이번 주 추천: {rec}")
 
+    pdf_bytes = _weekly_report_pdf_bytes(
+        end_date=end_date,
+        avg_prime_start_text=avg_prime_start_text,
+        avg_crash_len=avg_crash_len,
+        sleep_48h=sleep_48h,
+        sleep_7d_avg=sleep_7d_avg,
+        sleep_debt_7d=sleep_debt_7d,
+        caffeine_total_mg=caffeine_total_mg,
+        recommendation=rec,
+    )
+    st.download_button(
+        "주간 리포트 PDF 다운로드",
+        data=pdf_bytes,
+        file_name=f"neuroframe_weekly_{end_date.isoformat()}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
 
 def render_dashboard(repo, username: str, baseline: UserBaseline):
     st.caption("면책: 본 예측은 입력값 기반 참고 정보이며 의료 조언이 아닙니다.")
@@ -1015,10 +1351,12 @@ def render_dashboard(repo, username: str, baseline: UserBaseline):
     st.info(f"예측 신뢰도: **{conf_label}** ({conf_score}/100)")
     if conf_reasons:
         st.caption("신뢰도 하락 요인: " + ", ".join(conf_reasons))
+    _render_stimulant_caffeine_notice(day_inputs)
 
     # 1.0 Summary-first dashboard
     render_summary_cards(out)
     render_today_recommendations(out)
+    render_calendar_conflicts(out)
 
     # 2.x Shift mode
     blocks = _parse_shift_blocks_json(st.session_state.get("today_shift_blocks_json", "[]"))
@@ -1082,6 +1420,8 @@ def main():
 
     render_user_badge(user)
     baseline = user.baseline
+    st.session_state["profile_is_shift_worker"] = bool(getattr(user, "is_shift_worker", False))
+    st.session_state["profile_uses_adhd_medication"] = bool(getattr(user, "uses_adhd_medication", False))
 
     if not user.onboarded:
         st.sidebar.info("최초 1회 설정이 필요합니다.")
@@ -1093,13 +1433,14 @@ def main():
         st.session_state["today_loaded_once"] = True
 
     render_topbar()
-    render_morning_checkin(repo, username)
+    render_morning_checkin(repo, username, bool(getattr(user, "is_shift_worker", False)))
 
     if st.session_state["edit_today_open"]:
-        render_edit_panel(repo, username)
+        render_edit_panel(repo, username, bool(getattr(user, "uses_adhd_medication", False)))
     else:
         st.sidebar.info("상단의 **오늘 입력 수정** 버튼으로 수면/카페인/근무블록/부하를 조정할 수 있습니다.")
         if st.sidebar.button("오늘 로그 다시 불러오기", use_container_width=True):
+            _invalidate_repo_read_caches()
             load_today_state(repo, username)
             st.rerun()
 

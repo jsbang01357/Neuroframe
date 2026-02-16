@@ -12,6 +12,7 @@ class DoseDraft:
     hour: int
     minute: int
     amount_mg: float
+    dose_type: str = "caffeine"
 
 
 def doses_to_json(date: dt.date, tz, drafts: List[DoseDraft]) -> str:
@@ -20,7 +21,11 @@ def doses_to_json(date: dt.date, tz, drafts: List[DoseDraft]) -> str:
     Example:
       [{"hh":9,"mm":0,"mg":150.0}, ...]
     """
-    data = [{"hh": d.hour, "mm": d.minute, "mg": float(d.amount_mg)} for d in drafts if d.amount_mg > 0]
+    data = [
+        {"hh": d.hour, "mm": d.minute, "mg": float(d.amount_mg), "type": str(d.dose_type or "caffeine")}
+        for d in drafts
+        if d.amount_mg > 0
+    ]
     return json.dumps(data, ensure_ascii=False)
 
 
@@ -35,6 +40,7 @@ def doses_from_json(s: Optional[str]) -> List[DoseDraft]:
                 hour=int(item.get("hh", 0)),
                 minute=int(item.get("mm", 0)),
                 amount_mg=float(item.get("mg", 0.0)),
+                dose_type=str(item.get("type", "caffeine") or "caffeine"),
             ))
         return out
     except Exception:
@@ -52,7 +58,7 @@ def drafts_to_engine_doses(date: dt.date, tz, drafts: List[DoseDraft]):
         if d.amount_mg <= 0:
             continue
         ts = dt.datetime(date.year, date.month, date.day, d.hour, d.minute, tzinfo=tz)
-        out.append(Dose(time=ts, amount_mg=float(d.amount_mg)))
+        out.append(Dose(time=ts, amount_mg=float(d.amount_mg), dose_type=str(d.dose_type or "caffeine")))
     return out
 
 

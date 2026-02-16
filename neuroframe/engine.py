@@ -15,7 +15,8 @@ import datetime as dt
 class Dose:
     """Single dose event."""
     time: dt.datetime
-    amount_mg: float  # e.g., caffeine mg
+    amount_mg: float
+    dose_type: str = "caffeine"  # caffeine | mph_ir | mph_xr
 
 
 @dataclass
@@ -137,28 +138,109 @@ def sleep_pressure_signal(t: dt.datetime, wake_dt: dt.datetime, sleep_dt: dt.dat
         return 0.0
     return _clip(awake_h / H, 0.0, 1.2)  # allow slight >1 for late nights
 
-def caffeine_effect(
+def _dose_type(d: Dose) -> str:
+    return str(getattr(d, "dose_type", "caffeine") or "caffeine").strip().lower()
+
+
+def _caffeine_effect_single(
     t: dt.datetime,
-    doses: List[Dose],
+    d: Dose,
     half_life_hours: float,
     sensitivity: float = 1.0,
-    onset_minutes: int = 20
+    onset_minutes: int = 20,
+) -> float:
+    start = d.time + dt.timedelta(minutes=onset_minutes)
+    if t < start:
+        return 0.0
+    lam = math.log(2) / max(half_life_hours, 1e-6)
+    dh = (t - start).total_seconds() / 3600.0
+    return sensitivity * d.amount_mg * math.exp(-lam * dh)
+
+
+def _mph_ir_effect_single(t: dt.datetime, d: Dose) -> float:
+    # Quick rise + short decay.
+    start = d.time + dt.timedelta(minutes=25)
+    if t < start:
+        return 0.0
+    dh = (t - start).total_seconds() / 3600.0
+    rise = 1.0 - math.exp(-dh / 0.6)
+    decay = math.exp(-dh / 3.2)
+    return d.amount_mg * rise * decay * 3.0
+
+
+def _mph_xr_effect_single(t: dt.datetime, d: Dose) -> float:
+    # Slower rise + plateau + gradual decline (heuristic).
+    start = d.time + dt.timedelta(minutes=45)
+    if t < start:
+        return 0.0
+    dh = (t - start).total_seconds() / 3600.0
+    if dh < 2.0:
+        profile = dh / 2.0
+    elif dh < 6.0:
+        profile = 1.0
+    else:
+        profile = math.exp(-(dh - 6.0) / 3.5)
+    return d.amount_mg * profile * 2.2
+
+
+def stimulant_effect(
+    t: dt.datetime,
+    doses: List[Dose],
+    caffeine_half_life_hours: float,
+    caffeine_sensitivity: float = 1.0,
 ) -> float:
     """
-    Caffeine: exponential decay from dose time (with simple onset delay).
-    Returns in arbitrary units; later normalized by weights.
+    Combined stimulant effect:
+    - caffeine: exponential decay
+    - mph_ir: quick rise + short decay
+    - mph_xr: slow rise + plateau + gradual decay
     """
     if not doses:
         return 0.0
-    lam = math.log(2) / max(half_life_hours, 1e-6)
     total = 0.0
     for d in doses:
-        start = d.time + dt.timedelta(minutes=onset_minutes)
-        if t < start:
-            continue
-        dh = (t - start).total_seconds() / 3600.0
-        total += d.amount_mg * math.exp(-lam * dh)
-    return sensitivity * total
+        typ = _dose_type(d)
+        if typ == "caffeine":
+            total += _caffeine_effect_single(
+                t,
+                d,
+                half_life_hours=caffeine_half_life_hours,
+                sensitivity=caffeine_sensitivity,
+            )
+        elif typ in ("mph_ir", "stimulant_ir"):
+            total += _mph_ir_effect_single(t, d)
+        elif typ in ("mph_xr", "stimulant_xr"):
+            total += _mph_xr_effect_single(t, d)
+        else:
+            # Unknown types are treated as caffeine-like for backward safety.
+            total += _caffeine_effect_single(
+                t,
+                d,
+                half_life_hours=caffeine_half_life_hours,
+                sensitivity=caffeine_sensitivity,
+            )
+    return total
+
+
+def _rebound_windows(doses: List[Dose]) -> List[Tuple[dt.datetime, dt.datetime]]:
+    windows: List[Tuple[dt.datetime, dt.datetime]] = []
+    for d in doses:
+        typ = _dose_type(d)
+        if typ in ("mph_ir", "stimulant_ir"):
+            windows.append((d.time + dt.timedelta(hours=4.0), d.time + dt.timedelta(hours=7.0)))
+        elif typ in ("mph_xr", "stimulant_xr"):
+            windows.append((d.time + dt.timedelta(hours=8.0), d.time + dt.timedelta(hours=12.0)))
+    return windows
+
+
+def _rebound_mask(t_grid: List[dt.datetime], doses: List[Dose]) -> List[bool]:
+    windows = _rebound_windows(doses)
+    if not windows:
+        return [False for _ in t_grid]
+    mask: List[bool] = []
+    for t in t_grid:
+        mask.append(any(s <= t < e for (s, e) in windows))
+    return mask
 
 def load_signal_constant(workload_level: float) -> float:
     """
@@ -217,11 +299,11 @@ def predict_day(
     for t in t_grid:
         c = circadian_signal(t, wake_dt, baseline.chronotype_shift_hours)
         s = sleep_pressure_signal(t, wake_dt, sleep_dt, H=sleep_pressure_H)
-        d = caffeine_effect(
+        d = stimulant_effect(
             t,
             doses=doses,
-            half_life_hours=baseline.caffeine_half_life_hours,
-            sensitivity=baseline.caffeine_sensitivity,
+            caffeine_half_life_hours=baseline.caffeine_half_life_hours,
+            caffeine_sensitivity=baseline.caffeine_sensitivity,
         )
         l = Lc
 
@@ -250,11 +332,23 @@ def predict_day(
     prime = [x >= prime_th for x in net]
     crash = [x <= crash_th for x in net]
 
+    rebound_candidate = _rebound_mask(t_grid, doses)
+    crash_with_rebound = [crash[i] or rebound_candidate[i] for i in range(len(crash))]
+
     # Sleep gate: net low-ish AND sleep pressure high-ish (heuristic)
     # Using normalized net + raw sleep pressure.
     sleep_gate = [(net[i] <= 0.35 and sp[i] >= 0.70) for i in range(len(net))]
 
-    zones = {"prime": prime, "crash": crash, "sleep_gate": sleep_gate}
+    zones = {
+        "prime": prime,
+        "crash": crash_with_rebound,
+        "sleep_gate": sleep_gate,
+        "rebound_candidate": rebound_candidate,
+    }
+
+    dose_types = [_dose_type(d) for d in doses]
+    stimulant_types = [t for t in dose_types if t in ("mph_ir", "mph_xr", "stimulant_ir", "stimulant_xr")]
+    rebound_windows = _rebound_windows(doses)
 
     meta = {
         "step_minutes": step_minutes,
@@ -271,6 +365,13 @@ def predict_day(
             "drug_weight": baseline.drug_weight,
             "load_weight": baseline.load_weight,
         },
+        "dose_summary": {
+            "total_doses": len(doses),
+            "caffeine_doses": sum(1 for t in dose_types if t == "caffeine"),
+            "stimulant_doses": len(stimulant_types),
+            "stimulant_types": sorted(set(stimulant_types)),
+        },
+        "rebound_windows": [(s.isoformat(), e.isoformat()) for (s, e) in rebound_windows],
     }
 
     return CurveOutput(

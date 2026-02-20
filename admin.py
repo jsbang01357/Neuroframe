@@ -109,6 +109,21 @@ def _fetch_logs_for_user(db: NeuroGSheets, username: str) -> List[Dict[str, Any]
     return out
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_fetch_all_users(_db: NeuroGSheets) -> List[Dict[str, Any]]:
+    return _fetch_all_users(_db)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_fetch_logs_for_user(_db: NeuroGSheets, username: str) -> List[Dict[str, Any]]:
+    return _fetch_logs_for_user(_db, username)
+
+
+def _invalidate_admin_caches() -> None:
+    _cached_fetch_all_users.clear()
+    _cached_fetch_logs_for_user.clear()
+
+
 # ----------------------------
 # UI
 # ----------------------------
@@ -140,11 +155,12 @@ def render_admin_page(repo: NeuroRepo, spreadsheet_name: str = "NeuroFrame_DB") 
 
     if st.button("평문 비밀번호 일괄 해시 마이그레이션", use_container_width=True):
         migrated = repo.migrate_plaintext_passwords()
+        _invalidate_admin_caches()
         st.success(f"{migrated}개 계정을 해시로 변환했습니다.")
         st.rerun()
 
     st.subheader("유저 목록")
-    users = _fetch_all_users(db)
+    users = _cached_fetch_all_users(db)
     if not users:
         st.warning("users 시트에 유저가 없습니다.")
         return
@@ -247,6 +263,7 @@ def render_admin_page(repo: NeuroRepo, spreadsheet_name: str = "NeuroFrame_DB") 
         }
         ok = repo.update_user_baseline(selected, patch)
         if ok:
+            _invalidate_admin_caches()
             st.success("저장되었습니다.")
         else:
             st.error("저장에 실패했습니다.")
@@ -279,34 +296,42 @@ def render_admin_page(repo: NeuroRepo, spreadsheet_name: str = "NeuroFrame_DB") 
     st.divider()
     st.subheader("Daily Logs 조회")
 
-    logs = _fetch_logs_for_user(db, selected)
+    logs = _cached_fetch_logs_for_user(db, selected)
     n = st.slider("표시 개수", 5, 100, 20)
     logs = logs[:n]
 
     if not logs:
         st.info("해당 유저의 daily_logs가 없습니다.")
-        return
+    else:
+        # Display as table
+        # Keep only key columns for readability
+        cols = [
+            "date",
+            "sleep_override_on",
+            "sleep_cross_midnight",
+            "sleep_start",
+            "wake_time",
+            "workload_level",
+            "subjective_clarity",
+            "updated_at",
+        ]
+        table = [{k: r.get(k, "") for k in cols} for r in logs]
+        st.dataframe(table, use_container_width=True)
 
-    # Display as table
-    # Keep only key columns for readability
-    cols = [
-        "date",
-        "sleep_override_on",
-        "sleep_cross_midnight",
-        "sleep_start",
-        "wake_time",
-        "workload_level",
-        "subjective_clarity",
-        "updated_at",
-    ]
-    table = [{k: r.get(k, "") for k in cols} for r in logs]
-    st.dataframe(table, use_container_width=True)
+        # Optional: show doses_json on demand
+        with st.expander("doses_json 보기 (최근 로그)"):
+            for r in logs[:10]:
+                st.markdown(f"**{r.get('date','')}**  · doses_json:")
+                st.code(r.get("doses_json", "[]") or "[]", language="json")
 
-    # Optional: show doses_json on demand
-    with st.expander("doses_json 보기 (최근 로그)"):
-        for r in logs[:10]:
-            st.markdown(f"**{r.get('date','')}**  · doses_json:")
-            st.code(r.get("doses_json", "[]") or "[]", language="json")
+    st.divider()
+    st.subheader("최근 오류 로그")
+    err_rows = repo.get_recent_admin_logs(limit=30)
+    err_rows = [r for r in err_rows if str(r.get("level", "")).lower() in ("error", "warn", "warning")]
+    if not err_rows:
+        st.caption("최근 오류 로그가 없습니다.")
+    else:
+        st.dataframe(err_rows[:20], use_container_width=True)
 
 
 # ----------------------------

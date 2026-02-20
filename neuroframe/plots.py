@@ -58,6 +58,7 @@ def plot_net_energy(
     prime_spans = _mask_to_spans(t, zones.get("prime", []))
     crash_spans = _mask_to_spans(t, zones.get("crash", []))
     gate_spans = _mask_to_spans(t, zones.get("sleep_gate", []))
+    rebound_spans = _mask_to_spans(t, zones.get("rebound_candidate", []))
 
     for (s, e) in prime_spans:
         ax.axvspan(s, e, alpha=0.15, label="_prime")
@@ -65,11 +66,13 @@ def plot_net_energy(
         ax.axvspan(s, e, alpha=0.15, label="_crash")
     for (s, e) in gate_spans:
         ax.axvspan(s, e, alpha=0.15, label="_sleep_gate")
+    for (s, e) in rebound_spans:
+        ax.axvspan(s, e, alpha=0.10, hatch="////", label="_rebound")
 
     # Legend labels (avoid duplicates)
     handles, labels = ax.get_legend_handles_labels()
     # Add zone legend entries as dummy handles (once)
-    zone_labels = ["Prime Zone", "Crash Zone", "Sleep Gate"]
+    zone_labels = ["Prime Zone", "Crash Zone", "Sleep Gate", "Rebound Candidate"]
     for zl in zone_labels:
         if zl not in labels:
             ax.plot([], [], label=zl)

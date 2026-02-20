@@ -47,7 +47,7 @@ def _plan_to_drafts(plan: str) -> list[DoseDraft]:
     return [DoseDraft(8, 30, 180.0), DoseDraft(13, 30, 120.0)]
 
 
-def render_morning_checkin(repo, username: str, save_today_state_func):
+def render_morning_checkin(repo, username: str, save_today_state_func, is_shift_worker: bool):
     now = dt.datetime.now(TZ)
     today = now.date()
     if st.session_state["today_date"] != today:
@@ -67,7 +67,9 @@ def render_morning_checkin(repo, username: str, save_today_state_func):
         sleep_start = st.time_input("실제 취침", value=st.session_state["today_sleep_start"], key="morning_sleep_start")
         wake_time = st.time_input("실제 기상", value=st.session_state["today_wake_time"], key="morning_wake_time")
     with c2:
-        shift_template = st.selectbox("Shift 템플릿", ["Off", "Day", "Evening", "Night", "24h-call"], index=0)
+        shift_template = "Off"
+        if is_shift_worker:
+            shift_template = st.selectbox("Shift 템플릿", ["Off", "Day", "Evening", "Night", "24h-call"], index=0)
         plan = st.selectbox("카페인 계획(대략)", ["없음", "라이트", "보통", "높음"], index=2)
         workload = st.slider("오늘 workload", 0.0, 3.0, value=float(st.session_state["today_workload"]), step=0.5)
 
@@ -80,8 +82,11 @@ def render_morning_checkin(repo, username: str, save_today_state_func):
         st.session_state["today_shift_blocks_json"] = _shift_blocks_to_json(_shift_template_blocks(shift_template))
         st.session_state["today_shift_hours"] = _template_shift_hours(shift_template)
         st.session_state["today_workload"] = float(workload)
-
-        save_today_state_func(repo, username)
-        st.session_state["morning_checkin_done_date"] = today.isoformat()
-        st.success("체크인 완료. 오늘 요약을 업데이트합니다.")
-        st.rerun()
+        
+        try:
+            save_today_state_func(repo, username)
+            st.session_state["morning_checkin_done_date"] = today.isoformat()
+            st.success("체크인 완료. 오늘 요약을 업데이트합니다.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"아침 체크인 저장 실패: {e}")

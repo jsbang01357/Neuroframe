@@ -145,7 +145,7 @@ def _add_preset_dose(drafts: List[DoseDraft], preset: str) -> List[DoseDraft]:
         new_drafts.append(DoseDraft(16, 0, 20.0))
     return new_drafts[:6]
 
-def render_edit_panel(repo, username: str, load_func, save_func):
+def render_edit_panel(repo, username: str, load_func, save_func, uses_adhd_medication: bool):
     st.sidebar.header("오늘 입력")
 
     date = st.sidebar.date_input("날짜", value=st.session_state["today_date"])
@@ -159,6 +159,18 @@ def render_edit_panel(repo, username: str, load_func, save_func):
             st.sidebar.success("최근 패턴으로 기본값을 채웠습니다.")
             st.rerun()
         st.sidebar.warning("참조할 최근 로그가 부족합니다.")
+
+    if st.sidebar.button("어제 카페인 입력 복사", use_container_width=True):
+        from data.cache import _cached_daily_log
+        yesterday = st.session_state["today_date"] - dt.timedelta(days=1)
+        prev = _cached_daily_log(repo, username, yesterday.isoformat()) or {}
+        prev_doses = str(prev.get("doses_json", "[]") or "[]")
+        if prev_doses != "[]":
+            drafts = [d for d in doses_from_json(prev_doses) if str(getattr(d, "dose_type", "caffeine")).strip().lower() == "caffeine"]
+            st.session_state["today_doses_json"] = doses_to_json(st.session_state["today_date"], TZ, drafts)
+            st.sidebar.success("어제 카페인 패턴을 복사했습니다.")
+            st.rerun()
+        st.sidebar.info("어제 복사할 카페인 입력이 없습니다.")
 
     st.sidebar.subheader("Shift 템플릿")
     tcol1, tcol2, tcol3 = st.sidebar.columns(3)
@@ -204,10 +216,18 @@ def render_edit_panel(repo, username: str, load_func, save_func):
     else:
         st.sidebar.caption("기본값(온보딩 baseline)을 사용합니다.")
 
-    st.sidebar.subheader("카페인")
+    def _dose_type_label(v: str) -> str:
+        key = str(v or "caffeine").strip().lower()
+        if key == "mph_ir":
+            return "MPH IR"
+        if key == "mph_xr":
+            return "MPH XR"
+        return "Caffeine"
+
+    st.sidebar.subheader("자극제/카페인")
     drafts = doses_from_json(st.session_state["today_doses_json"])
     if not drafts:
-        drafts = [DoseDraft(9, 0, 150.0)]
+        drafts = [DoseDraft(9, 0, 150.0, "caffeine")]
 
     preset = st.sidebar.selectbox(
         "빠른 프리셋",
@@ -225,13 +245,24 @@ def render_edit_panel(repo, username: str, load_func, save_func):
     new_drafts: List[DoseDraft] = []
     for i in range(n):
         st.sidebar.markdown(f"**Dose {i + 1}**")
-        cc1, cc2 = st.sidebar.columns(2)
-        with cc1:
-            hour = st.number_input("시", 0, 23, value=int(drafts[i].hour), key=f"dose_h_{i}")
-            minute = st.number_input("분", 0, 59, value=int(drafts[i].minute), key=f"dose_m_{i}")
-        with cc2:
-            mg = st.number_input("mg", 0.0, 400.0, value=float(drafts[i].amount_mg), step=10.0, key=f"dose_mg_{i}")
-        new_drafts.append(DoseDraft(int(hour), int(minute), float(mg)))
+        hour = st.number_input("시", 0, 23, value=int(drafts[i].hour), key=f"dose_h_{i}")
+        minute = st.number_input("분", 0, 59, value=int(drafts[i].minute), key=f"dose_m_{i}")
+        mg = st.number_input("mg", 0.0, 400.0, value=float(drafts[i].amount_mg), step=10.0, key=f"dose_mg_{i}")
+        if uses_adhd_medication:
+            dose_type = st.selectbox(
+                "타입",
+                ["caffeine", "mph_ir", "mph_xr"],
+                index=["caffeine", "mph_ir", "mph_xr"].index(
+                    str(getattr(drafts[i], "dose_type", "caffeine") or "caffeine").strip().lower()
+                )
+                if str(getattr(drafts[i], "dose_type", "caffeine") or "caffeine").strip().lower() in ("caffeine", "mph_ir", "mph_xr")
+                else 0,
+                key=f"dose_type_{i}",
+                format_func=_dose_type_label,
+            )
+        else:
+            dose_type = "caffeine"
+        new_drafts.append(DoseDraft(int(hour), int(minute), float(mg), str(dose_type)))
 
     st.sidebar.subheader("오늘 shift 보정")
     st.session_state["today_shift_hours"] = st.sidebar.slider(
@@ -248,7 +279,10 @@ def render_edit_panel(repo, username: str, load_func, save_func):
 
     apply = st.sidebar.button("저장하고 적용", type="primary", use_container_width=True)
     if apply:
-        st.session_state["today_doses_json"] = doses_to_json(date, TZ, new_drafts)
-        save_func(repo, username)
-        st.session_state["edit_today_open"] = False
-        st.rerun()
+        try:
+            st.session_state["today_doses_json"] = doses_to_json(date, TZ, new_drafts)
+            save_func(repo, username)
+            st.session_state["edit_today_open"] = False
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"오늘 입력 저장 실패: {e}")

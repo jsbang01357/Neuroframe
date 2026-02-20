@@ -12,15 +12,36 @@ class DoseDraft:
     hour: int
     minute: int
     amount_mg: float
+    dose_type: str = "caffeine"
+
+
+def _normalize_dose_type(v: Any) -> str:
+    raw = str(v or "caffeine").strip().lower()
+    if raw in ("mph_ir", "stimulant_ir"):
+        return "mph_ir"
+    if raw in ("mph_xr", "stimulant_xr"):
+        return "mph_xr"
+    return "caffeine"
 
 
 def doses_to_json(date: dt.date, tz, drafts: List[DoseDraft]) -> str:
     """
     Store minimal dose info as JSON (local time).
     Example:
-      [{"hh":9,"mm":0,"mg":150.0}, ...]
+      [{"hh":9,"mm":0,"mg":150.0,"type":"caffeine"}, ...]
     """
-    data = [{"hh": d.hour, "mm": d.minute, "mg": float(d.amount_mg)} for d in drafts if d.amount_mg > 0]
+    data = []
+    for d in drafts:
+        if d.amount_mg <= 0:
+            continue
+        data.append(
+            {
+                "hh": int(d.hour),
+                "mm": int(d.minute),
+                "mg": float(d.amount_mg),
+                "type": _normalize_dose_type(getattr(d, "dose_type", "caffeine")),
+            }
+        )
     return json.dumps(data, ensure_ascii=False)
 
 
@@ -29,12 +50,24 @@ def doses_from_json(s: Optional[str]) -> List[DoseDraft]:
         return []
     try:
         arr = json.loads(s)
+        if not isinstance(arr, list):
+            return []
         out: List[DoseDraft] = []
         for item in arr:
+            if not isinstance(item, dict):
+                continue
+            # Legacy compatibility:
+            # - old key names: hour/minute/amount_mg/dose_type
+            # - missing type -> caffeine fallback
+            hh = item.get("hh", item.get("hour", 0))
+            mm = item.get("mm", item.get("minute", 0))
+            mg = item.get("mg", item.get("amount_mg", 0.0))
+            typ = item.get("type", item.get("dose_type", "caffeine"))
             out.append(DoseDraft(
-                hour=int(item.get("hh", 0)),
-                minute=int(item.get("mm", 0)),
-                amount_mg=float(item.get("mg", 0.0)),
+                hour=int(hh),
+                minute=int(mm),
+                amount_mg=float(mg),
+                dose_type=_normalize_dose_type(typ),
             ))
         return out
     except Exception:
@@ -52,7 +85,7 @@ def drafts_to_engine_doses(date: dt.date, tz, drafts: List[DoseDraft]):
         if d.amount_mg <= 0:
             continue
         ts = dt.datetime(date.year, date.month, date.day, d.hour, d.minute, tzinfo=tz)
-        out.append(Dose(time=ts, amount_mg=float(d.amount_mg)))
+        out.append(Dose(time=ts, amount_mg=float(d.amount_mg), dose_type=_normalize_dose_type(d.dose_type)))
     return out
 
 

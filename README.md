@@ -30,6 +30,10 @@ It is not a medical treatment app. It is a day-design tool based on a lightweigh
 - End-of-day check-in (subjective clarity, focus success, notes)
 - Weekly report (prime average start, crash average length, sleep debt, caffeine total)
 - Shift-aware interpretation (zone overlap warnings + nap suggestions)
+- Optional Google Calendar read integration (meeting conflicts with Prime Zone)
+- Export:
+  - recommended blocks as iCal (`.ics`)
+  - weekly report as PDF
 - Basic adaptation (`baseline_offset`) from daily self-rating
 - Admin page for user baseline editing and log inspection
 
@@ -89,6 +93,11 @@ auth_uri = "https://accounts.google.com/o/oauth2/auth"
 token_uri = "https://oauth2.googleapis.com/token"
 auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
 client_x509_cert_url = "..."
+
+# Optional: Google Calendar integration
+google_calendar_id = "your-calendar-id@group.calendar.google.com"
+# Optional: domain-wide delegation subject
+google_calendar_delegated_user = "user@your-domain.com"
 ```
 
 4. Prepare Google Spreadsheet named `NeuroFrame_DB` with worksheets:

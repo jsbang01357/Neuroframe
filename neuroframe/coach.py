@@ -63,6 +63,7 @@ def interpret_zones(out: CurveOutput) -> List[str]:
     prime_spans = _mask_to_spans(t, zones.get("prime", []))
     crash_spans = _mask_to_spans(t, zones.get("crash", []))
     gate_spans = _mask_to_spans(t, zones.get("sleep_gate", []))
+    rebound_spans = _mask_to_spans(t, zones.get("rebound_candidate", []))
 
     insights: List[str] = []
 
@@ -87,6 +88,11 @@ def interpret_zones(out: CurveOutput) -> List[str]:
     else:
         insights.append("오늘은 뚜렷한 **Sleep Gate**가 약하게 나타날 수 있습니다. 취침 목표가 있다면, 취침 60–90분 전부터 스크린/카페인을 줄이는 것이 유리할 수 있습니다.")
 
+    if rebound_spans:
+        top = _top_spans_by_duration(rebound_spans, max_n=1)
+        s, e = top[0]
+        insights.append(f"약효 감소에 따른 **Rebound 후보 구간**이 {_format_time_range(s, e)}에 나타날 수 있습니다. 고부하 업무는 앞당기고, 해당 구간엔 저부하 루틴을 배치하는 편이 안전할 수 있습니다.")
+
     return insights
 
 
@@ -109,6 +115,10 @@ def design_schedule(
     prime_spans = _mask_to_spans(t, zones.get("prime", []))
     crash_spans = _mask_to_spans(t, zones.get("crash", []))
     gate_spans = _mask_to_spans(t, zones.get("sleep_gate", []))
+    rebound_spans = _mask_to_spans(t, zones.get("rebound_candidate", []))
+
+    # Rebound windows are treated as extra crash candidates.
+    crash_spans = crash_spans + rebound_spans
 
     suggestions: List[BlockSuggestion] = []
 

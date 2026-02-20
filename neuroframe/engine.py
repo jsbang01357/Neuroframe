@@ -303,3 +303,76 @@ def calibrate_baseline_offset(
     clarity = _clip(subjective_clarity_0_10 / 10.0, 0.0, 1.0)
     err = clarity - _clip(predicted_net_mean_0_1, 0.0, 1.0)
     return (1 - eta) * current_offset + eta * (current_offset + k * err)
+
+
+def tune_user_weights(
+    baseline: UserBaseline,
+    recent_logs: List[Dict[str, Any]],
+    learning_rate: float = 0.05
+) -> Dict[str, float]:
+    """
+    Tune baseline weights based on recent daily logs.
+    Returns a dict with updated weights.
+    
+    Heuristics:
+    - If user had high caffeine (implied by high doses) but reported low clarity,
+      they might be less sensitive to caffeine -> decrease caffeine_sensitivity.
+    - If user had high caffeine and high clarity -> increase caffeine_sensitivity.
+    - If user shifted sleep drastically but clarity was high -> circadian_weight might be less important (lower it).
+    """
+    if not recent_logs:
+        return {}
+
+    avg_clarity = 0.0
+    avg_caffeine = 0.0
+    valid_days = 0
+
+    for log in recent_logs:
+        clarity = float(log.get("subjective_clarity", -1.0))
+        if clarity < 0:
+            continue
+            
+        doses_json = log.get("doses_json", "[]")
+        day_caffeine = 0.0
+        try:
+            import json
+            doses = json.loads(doses_json)
+            for d in doses:
+                day_caffeine += float(d.get("amount_mg", 0.0))
+        except:
+            pass
+            
+        avg_clarity += clarity
+        avg_caffeine += day_caffeine
+        valid_days += 1
+
+    if valid_days == 0:
+        return {}
+        
+    avg_clarity /= valid_days
+    avg_caffeine /= valid_days
+
+    # Current values
+    new_sens = baseline.caffeine_sensitivity
+    new_circ = baseline.circadian_weight
+    
+    # 1) Caffeine sensitivity tuning
+    # High caffeine > 200mg, low clarity < 4.0 => decrease sensitivity
+    if avg_caffeine > 200.0 and avg_clarity < 4.0:
+        new_sens = max(0.5, new_sens * (1 - learning_rate))
+    # High caffeine > 200mg, high clarity > 7.0 => increase sensitivity
+    elif avg_caffeine > 200.0 and avg_clarity >= 7.0:
+        new_sens = min(2.0, new_sens * (1 + learning_rate))
+        
+    # 2) Circadian weight tuning 
+    # If user generally feels terrible (low clarity), maybe circadian misalignment is hitting hard?
+    if avg_clarity < 4.0:
+        new_circ = min(2.0, new_circ * (1 + learning_rate))
+    elif avg_clarity > 8.0:
+        # Feeling great constantly, maybe circadian isn't as strict a constraint
+        new_circ = max(0.5, new_circ * (1 - learning_rate))
+
+    return {
+        "caffeine_sensitivity": round(new_sens, 3),
+        "circadian_weight": round(new_circ, 3)
+    }

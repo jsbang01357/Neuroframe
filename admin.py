@@ -253,6 +253,30 @@ def render_admin_page(repo: NeuroRepo, spreadsheet_name: str = "NeuroFrame_DB") 
         st.rerun()
 
     st.divider()
+    st.subheader("모델 개인화 (자동 가중치 튜닝)")
+    st.caption("최근 7일간의 주관적 명료도 로그를 분석하여 카페인 민감도와 일주기 가중치를 최적화합니다.")
+    if st.button("가중치 자동 튜닝 실행", use_container_width=True):
+        from neuroframe.engine import tune_user_weights
+        recent_logs = _fetch_logs_for_user(db, selected)[:7]
+        
+        if not recent_logs:
+            st.warning("분석할 최근 7일간의 로그 데이터가 없습니다.")
+        else:
+            updated_weights = tune_user_weights(uobj.baseline, recent_logs)
+            if not updated_weights:
+                st.info("유의미한 주관적 명료도 데이터가 부족하여 튜닝이 보류되었습니다 (최소 1일치 필요).")
+            else:
+                ok = repo.update_user_baseline(selected, {
+                    "caffeine_sensitivity": str(updated_weights.get("caffeine_sensitivity", sensitivity)),
+                    "circadian_weight": str(updated_weights.get("circadian_weight", w_c))
+                })
+                if ok:
+                    st.success(f"가중치 자동 튜닝 완료! 변경 사항: {updated_weights}")
+                    st.rerun()
+                else:
+                    st.error("가중치 업데이트에 실패했습니다.")
+
+    st.divider()
     st.subheader("Daily Logs 조회")
 
     logs = _fetch_logs_for_user(db, selected)
